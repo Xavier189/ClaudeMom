@@ -28,9 +28,18 @@ import { createConversationService } from "./conversation-service.mjs";
 import { isPatchedStartupAsset, startupAssets } from "./scripts/patch-dictation-start.mjs";
 import { createStateStore, dropUnroutedModels, gatewayBody, gatewayModel, gatewayTarget, modelLabel, modelList, modelSelectors, modelWindow, planProfile, runtimeConfig } from "./runtime.mjs";
 import { createOfficialAssets } from "./official-assets.mjs";
+import { listCliSkills } from "./cli-skills.mjs";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const runtime = runtimeConfig();
+const cliSkillsDirectory = process.env.CLAUDE_LOCAL_CLI_SKILLS_DIR;
+const CLI_SKILLS_SCRIPT_PATH = "/__claudemom/cli-skills.js";
+const cliSkillsScript = runtime.managed && cliSkillsDirectory
+  ? fs.readFileSync(path.join(here, "cli-skills-panel.js")) : null;
+function addCliSkillsPanel(html) {
+  if (!cliSkillsScript || html.includes(`src="${CLI_SKILLS_SCRIPT_PATH}"`)) return html;
+  return html.replace(/<\/head\s*>/i, `<script defer src="${CLI_SKILLS_SCRIPT_PATH}"></script></head>`);
+}
 const officialAssets = runtime.managed
   ? createOfficialAssets(process.env.CLAUDE_LOCAL_DESKTOP_RESOURCES)
   : null;
@@ -76,7 +85,7 @@ function addLocalizationShim(html, officialLocales) {
 }
 
 const officialShell = runtime.managed
-  ? addLocalizationShim(officialAssets.indexHtml, officialAssets.i18nLocales)
+  ? addCliSkillsPanel(addLocalizationShim(officialAssets.indexHtml, officialAssets.i18nLocales))
   : null;
 const args = process.argv.slice(2);
 const arg = (name, fallback) => {
@@ -704,6 +713,21 @@ function mockEdgeApi(req, res, url) {
 // 否则模板的 false 会盖掉。id 的算法跟模板走：只改写模板自带的 GrowthBook 表，
 // 合成兜底（localBootstrap 的空表）的 hashing_algorithm 不同，不往里塞。
 const COWORK_FEATURE_ID = "574905726";
+// Desktop 5.11492.5 and web build aadd83568f gate their backdrop renderer
+// separately. Recorded bootstraps predate both gates. Enable the real renderer;
+// its mounted Theme layer remains responsible for advertising ui_attach.draws.
+const THEME_RENDERER_FEATURE_IDS = ["3829528001", "1253327512"];
+function enableLocalThemeRenderer(result) {
+  if (!runtime.managed) return;
+  const growthbook = result.org_growthbook ?? {};
+  result.org_growthbook = {
+    ...growthbook,
+    features: {
+      ...growthbook.features,
+      ...Object.fromEntries(THEME_RENDERER_FEATURE_IDS.map((id) => [id, { defaultValue: true }])),
+    },
+  };
+}
 function forceCowork(result, template) {
   if (!template?.org_growthbook?.features || !result.org_growthbook?.features) return;
   result.org_growthbook = {
@@ -728,6 +752,7 @@ function resolvedBootstrap() {
     "web.plan_name.max_20x": runtime.localization ? "Codex++ 本地网关" : "Codex++ local gateway",
   };
   if (runtime.cowork) forceCowork(result, template);
+  enableLocalThemeRenderer(result);
   mergePoolModels(result);
   resolvedBootstrapCache = result;
   return result;
@@ -1353,7 +1378,8 @@ function readDocShell(host) {
 // 绝不回放登出落地页桩体——那会让 SPA 永远卡在骨架屏。
 function serveDocShell(req, res, url) {
   const host = url.host || "claude.ai";
-  const cached = readDocShell(host);
+  const cachedBody = readDocShell(host);
+  const cached = cachedBody ? Buffer.from(addCliSkillsPanel(cachedBody.toString("utf8"))) : null;
   if (cached) {
     res.writeHead(200, {
       "content-type": "text/html; charset=utf-8",
@@ -1390,11 +1416,12 @@ function serveDocShell(req, res, url) {
             JSON.stringify({ status: 200, headers: { "content-type": "text/html" }, url: `${host}/epitaxy` }),
           );
         }
+        const responseBody = r.statusCode === 200 ? Buffer.from(addCliSkillsPanel(body.toString("utf8"))) : body;
         res.writeHead(r.statusCode || 502, {
           "content-type": "text/html; charset=utf-8",
-          "content-length": body.length,
+          "content-length": responseBody.length,
         });
-        res.end(body);
+        res.end(responseBody);
       });
     },
   );
@@ -1467,12 +1494,13 @@ function upstreamRequest(target, options, callback) {
   const proxyAuth = UPSTREAM_PROXY.username
     ? { "proxy-authorization": `Basic ${Buffer.from(`${decodeURIComponent(UPSTREAM_PROXY.username)}:${decodeURIComponent(UPSTREAM_PROXY.password)}`).toString("base64")}` }
     : {};
-  return https.request({
+  let connect;
+  const request = https.request({
     ...options,
     agent: undefined,
     // ClientRequest 支持回调式 createConnection：隧道建好后再交出 TLS socket。
     createConnection: (_options, done) => {
-      const connect = http.request({
+      connect = http.request({
         host: UPSTREAM_PROXY.hostname,
         port: Number(UPSTREAM_PROXY.port || 80),
         method: "CONNECT",
@@ -1492,6 +1520,13 @@ function upstreamRequest(target, options, callback) {
       connect.end();
     },
   }, callback);
+  const destroy = request.destroy;
+  request.destroy = function (error) {
+    // ClientRequest 在 createConnection 回调前还没有 socket，取消时须同时关闭 CONNECT。
+    connect?.destroy(error);
+    return destroy.call(this, error);
+  };
+  return request;
 }
 
 function proxyUpstream(req, res, url) {
@@ -1592,6 +1627,27 @@ function handle(req, res, hostHeader) {
 
   const hostName = url.hostname.toLowerCase();
   const isMainClaudeHost = /^(claude\.ai|www\.claude\.ai|claude\.com|www\.claude\.com)$/.test(hostName);
+  if (runtime.managed && url.pathname.startsWith("/__claudemom/")) {
+    if (!isMainClaudeHost || req.method !== "GET" ||
+        (req.headers.origin && req.headers.origin !== url.origin) ||
+        req.headers["sec-fetch-site"] === "cross-site") {
+      return json(res, { error: "Local read-only resource unavailable" }, 403);
+    }
+    if (url.pathname === CLI_SKILLS_SCRIPT_PATH && cliSkillsScript) {
+      res.writeHead(200, {
+        "content-type": "text/javascript; charset=utf-8", "content-length": cliSkillsScript.length,
+        "cache-control": "no-store", "x-content-type-options": "nosniff",
+      });
+      return res.end(cliSkillsScript);
+    }
+    if (url.pathname === "/__claudemom/cli-skills") {
+      return void listCliSkills(cliSkillsDirectory).then((result) => json(res, {
+        ...result,
+        directoryLabel: process.env.CLAUDE_LOCAL_CODE_SHARE_HOME === "1" ? "~/.claude/skills" : "Code 独立配置目录中的 skills",
+      }));
+    }
+    return json(res, { error: "Local resource not found" }, 404);
+  }
   if (MODE === "mock" && req.method === "GET" &&
       (isMainClaudeHost || hostName === "api.anthropic.com") &&
       /^\/api\/(?:organizations\/[^/]+\/)?model_selector\/[^/]+\/?$/.test(url.pathname)) {

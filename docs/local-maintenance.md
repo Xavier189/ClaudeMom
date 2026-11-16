@@ -78,7 +78,7 @@
    ```
 
    状态备份含模型凭证，只保存在受保护的本地目录，不放进 Git 或公开附件。替换 `.app` 会保留 `~/.claude-mom` 中的模型、设置和对话数据。
-   Code 的独立配置由 `~/.claude-mom/settings.json` 中的 `claudeDesktopLocal.codeShareHome: false` 控制；其目录是 `~/.claude-desktop-local/claude-code`，不属于 Git 源码。
+   Code 配置目录由 `~/.claude-mom/settings.json` 的 `claudeDesktopLocal.codeShareHome` 控制，见「检查 Code 共享目录与主题」。运行配置不属于 Git 源码。
 
 3. 从 ClaudeMom 启动 Claude，完成实际交互验证。
 
@@ -91,6 +91,32 @@
    ```bash
    git tag "local/verified-$(date +%Y%m%d-%H%M%S)"
    ```
+
+## 检查 Code 共享目录与主题
+
+| `codeShareHome` | Code 配置目录 | 适用场景 |
+| --- | --- | --- |
+| `true` | `~/.claude` | 共用本机 CLI 安装的插件、个人 Skills、设置和会话 |
+| `false` | `~/.claude-desktop-local/claude-code` | 使用独立配置，CLI 的插件和 Skills 不自动共用 |
+
+修改目录选项后，结束需要保留的任务并重新启动 ClaudeMom 和 Claude，让下一批 Code 进程使用对应目录。共享模式也会读取 CLI 设置中的供应商地址、认证、MCP 和 hooks；遇到路由冲突时应检查这些设置，避免为修复 App 而直接覆盖 CLI 配置。
+
+在 Code 的自定义页面检查以下内容：
+
+1. 插件页的「我的」应列出所选配置目录中的插件。「在此项目中 0」只表示项目作用域没有插件，不代表用户作用域为空。
+2. Skills 页的「本机 Claude Code Skills」面板列出配置目录下直接包含 `SKILL.md` 的个人 Skill 目录，支持搜索、刷新和符号链接。列表按目录名展示，只读取目录名和修改时间；不复制正文，也不提供启停、修改或删除。插件内的 Skills 由官方列表列出。
+3. 在空测试目录新建 Code 会话，确认个人 Skill 和插件命令可发现。自定义页列表不代表 CLI 已完成初始化，也不代替实际调用验证。CLI 外部安装或更新后，已运行会话可使用 `/reload-plugins` 或重新开会话加载变化，参见[官方刷新说明](https://code.claude.com/docs/en/plugins/cli-reference#reload-plugins)。
+4. 安装主题插件时，调用其主题命令，在测试会话中应用主题，确认背景和控件实际变化。菜单能打开、主题能保存，均不足以证明窗口已绘制背景。
+
+个人 Skills 面板属于 ClaudeMom 的只读扩展，显示来源目录；官方 Skills 页面使用的账户/Cowork 存储与 CLI 个人目录相互独立。CLI 仍负责解析 Skill frontmatter、权限及是否允许用户调用；面板中的目录数不是启用数量。
+
+## 升级 Claude Desktop 后验证兼容性
+
+本地构建依赖已安装 Claude Desktop 的原生桥接和前端协议；维护 ClaudeMom 分支并不会解除这项依赖。ClaudeMom 更新、Claude Desktop 更新以及 Code CLI/插件更新应分别验证。
+
+主题兼容逻辑位于 `crates/claude-local/runtime/proxy.mjs` 的 `enableLocalThemeRenderer`。它为 Desktop 5.11492.5 的绘制开关 `3829528001` 和网页构建 `aadd83568f` 的开关 `1253327512` 提供 bootstrap 值。窗口实际挂载绘制层后，仍由官方实现发送 `ui_attach.draws`，本地服务不代发绘制能力。
+
+若更新后再次出现「主题保存但不显示」，先确认窗口加载的前端构建、主题开关和 Code 的绘制响应，再调整兼容逻辑；不能仅凭 App 版本推断实际网页构建，也不要把 `isDrawn` 写入配置作为开关。主题 API 的版本条件见[官方接口说明](https://code.claude.com/docs/en/plugins/mods/interface#put-a-backdrop-behind-the-conversation)。
 
 ## 处理失败与回滚
 

@@ -60,7 +60,7 @@ function writeAsar(resourcesDir, members) {
   fs.writeFileSync(path.join(resourcesDir, "ion-dist.asar"), Buffer.concat([prefix, ...bodies]));
 }
 
-async function request(instance, pathname, { host, body, type = "application/json", method = body === undefined ? "GET" : "POST", extraHeaders = {}, auth = true } = {}) {
+async function request(instance, pathname, { host, body, type = "application/json", method = body === undefined ? "GET" : "POST", extraHeaders = {}, auth = true, signal } = {}) {
   const raw = body === undefined ? null : Buffer.isBuffer(body) ? body : Buffer.from(JSON.stringify(body));
   const headers = {
     ...(raw ? { "content-type": type, "content-length": raw.length } : {}),
@@ -82,7 +82,7 @@ async function request(instance, pathname, { host, body, type = "application/jso
     return await new Promise((resolve, reject) => {
       const req = (host ? https : http).request({
         hostname: host || "127.0.0.1", port: host ? 443 : instance.port,
-        path: pathname, method, headers, ...(agent ? { agent } : {}),
+        path: pathname, method, headers, signal, ...(agent ? { agent } : {}),
       }, (res) => {
         const chunks = [];
         res.on("error", reject);
@@ -179,7 +179,7 @@ before(async () => {
     "audio/tone.mp3": Buffer.from([0x49, 0x44, 0x33]),
   });
   fs.mkdirSync(path.join(root, "runtime", "scripts"), { recursive: true });
-  for (const file of ["proxy.mjs", "conversation-service.mjs", "rpc.mjs", "runtime.mjs", "official-assets.mjs", "scripts/patch-dictation-start.mjs"]) {
+  for (const file of ["proxy.mjs", "conversation-service.mjs", "rpc.mjs", "runtime.mjs", "official-assets.mjs", "cli-skills.mjs", "cli-skills-panel.js", "scripts/patch-dictation-start.mjs"]) {
     fs.copyFileSync(path.join(here, file), path.join(root, "runtime", file));
   }
   fs.copyFileSync(
@@ -354,6 +354,104 @@ test("installed template fetches the first shell through the configured upstream
   }
 });
 
+test("outbound CONNECT TLS failures leave the managed proxy healthy", async () => {
+  const sockets = new Set();
+  let failure = "invalid";
+  const upstreamProxy = http.createServer();
+  upstreamProxy.on("connect", (_req, socket) => {
+    sockets.add(socket);
+    socket.on("error", () => {});
+    socket.once("close", () => sockets.delete(socket));
+    socket.write("HTTP/1.1 200 Connection Established\r\n\r\n");
+    socket.once("data", () => {
+      if (failure === "invalid") socket.end("invalid TLS response");
+      else socket.destroy();
+    });
+  });
+  upstreamProxy.listen(0, "127.0.0.1");
+  await once(upstreamProxy, "listening");
+  const instance = await start({
+    CLAUDE_LOCAL_UPSTREAM_PROXY: `http://127.0.0.1:${upstreamProxy.address().port}`,
+  });
+  try {
+    for (failure of ["invalid", "closed"]) {
+      const response = await request(instance, `/tls-${failure}.bin`, { host: "downloads.claude.ai" });
+      assert.equal(response.status, 502);
+      const health = await request(instance, "/__codex_claude_local/health");
+      assert.equal(health.status, 200);
+      assert.equal(health.json.pid, instance.child.pid);
+      assert.equal(instance.child.exitCode, null, instance.output());
+    }
+  } finally {
+    for (const socket of sockets) socket.destroy();
+    await stop(instance);
+    await new Promise((resolve) => upstreamProxy.close(resolve));
+  }
+});
+
+test("cancelling an upstream request closes pending CONNECT and TLS sockets", async () => {
+  const upstreamProxy = http.createServer();
+  upstreamProxy.listen(0, "127.0.0.1");
+  await once(upstreamProxy, "listening");
+  const instance = await start({
+    CLAUDE_LOCAL_UPSTREAM_PROXY: `http://127.0.0.1:${upstreamProxy.address().port}`,
+  });
+  let socket;
+  try {
+    for (const phase of ["connect", "tls"]) {
+      const connected = once(upstreamProxy, "connect");
+      const controller = new AbortController();
+      const response = request(instance, `/pending-${phase}.bin`, { host: "downloads.claude.ai", signal: controller.signal });
+      [, socket] = await connected;
+      socket.on("error", () => {});
+      socket.once("end", () => socket.end());
+      const closed = once(socket, "close").then(() => true);
+      if (phase === "tls") {
+        const handshake = once(socket, "data");
+        socket.write("HTTP/1.1 200 Connection Established\r\n\r\n");
+        await handshake;
+      }
+      socket.resume();
+      controller.abort();
+      await assert.rejects(response, /aborted/);
+      assert.equal(await Promise.race([closed, delay(1000).then(() => false)]), true, `cancelled ${phase} socket must close\n${instance.output()}`);
+      assert.equal((await request(instance, "/__codex_claude_local/health")).status, 200);
+    }
+  } finally {
+    socket?.destroy();
+    await stop(instance);
+    await new Promise((resolve) => upstreamProxy.close(resolve));
+  }
+});
+
+test("an upstream CONNECT timeout closes its socket and leaves health available", async () => {
+  const upstreamProxy = http.createServer();
+  const connected = once(upstreamProxy, "connect");
+  upstreamProxy.listen(0, "127.0.0.1");
+  await once(upstreamProxy, "listening");
+  const instance = await start({
+    CLAUDE_LOCAL_UPSTREAM_PROXY: `http://127.0.0.1:${upstreamProxy.address().port}`,
+  });
+  let socket;
+  try {
+    const response = request(instance, "/connect-timeout.bin", { host: "downloads.claude.ai" });
+    [, socket] = await connected;
+    socket.on("error", () => {});
+    socket.once("end", () => socket.end());
+    socket.resume();
+    const closed = once(socket, "close").then(() => true);
+    const result = await response;
+    assert.equal(result.status, 502);
+    assert.match(result.bytes.toString("utf8"), /upstream proxy timeout/);
+    assert.equal(await Promise.race([closed, delay(1000).then(() => false)]), true);
+    assert.equal((await request(instance, "/__codex_claude_local/health")).status, 200);
+  } finally {
+    socket?.destroy();
+    await stop(instance);
+    await new Promise((resolve) => upstreamProxy.close(resolve));
+  }
+});
+
 test("unpacked ion-dist directory is served when the Claude build ships no ASAR", async () => {
   // 部分 Claude 版本把前端解包成 resources/ion-dist/，没有 ion-dist.asar（issue #5）。
   const resourcesDir = path.join(root, "unpacked-resources");
@@ -427,7 +525,10 @@ test("installed template turns on the Cowork GrowthBook gate unless disabled", a
   fs.writeFileSync(path.join(runtimeDir, "mock", "bootstrap.json"), JSON.stringify({
     org_growthbook: {
       hashing_algorithm: "djb2",
-      features: { "574905726": { defaultValue: false }, "577907085": { defaultValue: true } },
+      features: {
+        "574905726": { defaultValue: false }, "577907085": { defaultValue: true },
+        "3829528001": { defaultValue: false },
+      },
     },
   }));
   const env = { CLAUDE_LOCAL_CACHE_DIR: path.join(runtimeDir, ".cache") };
@@ -443,8 +544,50 @@ test("installed template turns on the Cowork GrowthBook gate unless disabled", a
   assert.deepEqual(on.features["574905726"], { defaultValue: true });
   assert.deepEqual(on.features["577907085"], { defaultValue: true }, "其它功能保持模板原值");
   assert.equal(on.hashing_algorithm, "djb2");
+  for (const id of ["3829528001", "1253327512"]) {
+    assert.deepEqual(on.features[id], { defaultValue: true });
+  }
   const off = await features({ CLAUDE_LOCAL_COWORK: "0" });
   assert.deepEqual(off.features["574905726"], { defaultValue: false });
+});
+
+test("CLI Skills panel exposes only directory metadata and rejects cross-site or mutating requests", async () => {
+  const directory = path.join(root, "cli-skills");
+  fs.mkdirSync(path.join(directory, "my-skill"), { recursive: true });
+  const content = "---\nname: my-skill\n---\nprivate instructions stay on disk";
+  fs.writeFileSync(path.join(directory, "my-skill", "SKILL.md"), content);
+  const instance = await start({
+    CLAUDE_LOCAL_CLI_SKILLS_DIR: directory,
+    CLAUDE_LOCAL_CODE_SHARE_HOME: "1",
+  });
+  try {
+    const result = await request(instance, "/__claudemom/cli-skills?path=/etc", { host: "claude.ai" });
+    assert.equal(result.status, 200);
+    assert.equal(result.json.directoryLabel, "~/.claude/skills");
+    assert.equal(result.json.available, true);
+    assert.deepEqual(result.json.skills.map((skill) => skill.directoryName), ["my-skill"]);
+    assert.equal(result.bytes.includes(Buffer.from(directory)), false);
+    assert.equal(result.bytes.includes(Buffer.from("private instructions")), false);
+    const shell = await request(instance, "/customize/skills/yours", { host: "claude.ai" });
+    assert.equal(shell.bytes.toString().match(/src="\/__claudemom\/cli-skills.js"/g)?.length, 1);
+    const script = await request(instance, "/__claudemom/cli-skills.js", { host: "claude.ai" });
+    assert.equal(script.status, 200);
+    assert.match(script.headers["content-type"], /javascript/);
+    for (const options of [
+      { method: "POST", body: {} },
+      { extraHeaders: { origin: "https://untrusted.invalid" } },
+      { extraHeaders: { "sec-fetch-site": "cross-site" } },
+      { host: "assets-proxy.anthropic.com" },
+    ]) {
+      const denied = await request(instance, "/__claudemom/cli-skills", { host: "claude.ai", ...options });
+      assert.equal(denied.status, 403);
+      assert.equal(denied.headers["access-control-allow-origin"], undefined);
+    }
+    assert.equal((await request(instance, "/__claudemom/cli-skills/../../settings.json", { host: "claude.ai" })).bytes.includes(Buffer.from(content)), false);
+    assert.equal(fs.readFileSync(path.join(directory, "my-skill", "SKILL.md"), "utf8"), content);
+  } finally {
+    await stop(instance);
+  }
 });
 
 test("clean managed runtime uses synthetic bootstrap and configured catalogs without private recordings", async () => {
@@ -455,6 +598,9 @@ test("clean managed runtime uses synthetic bootstrap and configured catalogs wit
     assert.equal(result.json.account.email_address, "local@claude.local");
     assert.equal(result.json.locale, "zh-Hans");
     assert.deepEqual(result.json.gated_imports, {});
+    for (const id of ["3829528001", "1253327512"]) {
+      assert.deepEqual(result.json.org_growthbook.features[id], { defaultValue: true });
+    }
     assert.deepEqual(result.json.current_user_access.features, []);
     assert.equal(result.json.activeOrganization.uuid, result.json.resolved_org_uuid);
     assert.equal(result.json.activeOrganization.uuid, result.json.account.organization_uuid);
