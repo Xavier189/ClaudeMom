@@ -24,8 +24,6 @@ const START_TIMEOUT: Duration = Duration::from_secs(12);
 static OPERATION: Mutex<()> = Mutex::new(());
 
 const ASSETS: &[(&str, &[u8])] = &[
-    ("cli-skills.mjs", include_bytes!("../runtime/cli-skills.mjs")),
-    ("cli-skills-panel.js", include_bytes!("../runtime/cli-skills-panel.js")),
     (
         "proxy.mjs",
         include_bytes!("../runtime/proxy.mjs"),
@@ -1665,12 +1663,6 @@ fn start_backend(
         // 代理脚本按这个目录找听写凭据（变量名沿用 Codex++ 的，脚本两边共用）。
         .env("CODEX_PLUS_STATE_DIR", host().state_dir())
         .env("CLAUDE_LOCAL_CACHE_DIR", root.join(".cache"))
-        .env("CLAUDE_LOCAL_CLI_SKILLS_DIR", if code_share_home(config) {
-            home_dir().join(".claude/skills")
-        } else {
-            full_code_dir(root).join("skills")
-        })
-        .env("CLAUDE_LOCAL_CODE_SHARE_HOME", flag(code_share_home(config)))
         .env("CLAUDE_LOCAL_WEB_I18N_DIR", root.join("catalogs"))
         .env("CLAUDE_LOCAL_UPSTREAM_PROXY", upstream_web_proxy().unwrap_or_default())
         .env(

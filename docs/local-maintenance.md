@@ -104,11 +104,9 @@
 在 Code 的自定义页面检查以下内容：
 
 1. 插件页的「我的」应列出所选配置目录中的插件。「在此项目中 0」只表示项目作用域没有插件，不代表用户作用域为空。
-2. Skills 页的「本机 Claude Code Skills」面板列出配置目录下直接包含 `SKILL.md` 的个人 Skill 目录，支持搜索、刷新和符号链接。列表按目录名展示，只读取目录名和修改时间；不复制正文，也不提供启停、修改或删除。插件内的 Skills 由官方列表列出。
+2. 保留官方 Skills 页面。所查 Desktop 5.11492.5 和网页构建 `aadd83568f` 的列表使用账户/Cowork 存储与插件数据，不直接列出 CLI 的个人 Skills 目录。页面没有列出个人 Skill，不代表 Code 会话没有加载它。
 3. 在空测试目录新建 Code 会话，确认个人 Skill 和插件命令可发现。自定义页列表不代表 CLI 已完成初始化，也不代替实际调用验证。CLI 外部安装或更新后，已运行会话可使用 `/reload-plugins` 或重新开会话加载变化，参见[官方刷新说明](https://code.claude.com/docs/en/plugins/cli-reference#reload-plugins)。
 4. 安装主题插件时，调用其主题命令，在测试会话中应用主题，确认背景和控件实际变化。菜单能打开、主题能保存，均不足以证明窗口已绘制背景。
-
-个人 Skills 面板属于 ClaudeMom 的只读扩展，显示来源目录；官方 Skills 页面使用的账户/Cowork 存储与 CLI 个人目录相互独立。CLI 仍负责解析 Skill frontmatter、权限及是否允许用户调用；面板中的目录数不是启用数量。
 
 ## 升级 Claude Desktop 后验证兼容性
 

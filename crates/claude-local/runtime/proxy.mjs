@@ -28,18 +28,9 @@ import { createConversationService } from "./conversation-service.mjs";
 import { isPatchedStartupAsset, startupAssets } from "./scripts/patch-dictation-start.mjs";
 import { createStateStore, dropUnroutedModels, gatewayBody, gatewayModel, gatewayTarget, modelLabel, modelList, modelSelectors, modelWindow, planProfile, runtimeConfig } from "./runtime.mjs";
 import { createOfficialAssets } from "./official-assets.mjs";
-import { listCliSkills } from "./cli-skills.mjs";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const runtime = runtimeConfig();
-const cliSkillsDirectory = process.env.CLAUDE_LOCAL_CLI_SKILLS_DIR;
-const CLI_SKILLS_SCRIPT_PATH = "/__claudemom/cli-skills.js";
-const cliSkillsScript = runtime.managed && cliSkillsDirectory
-  ? fs.readFileSync(path.join(here, "cli-skills-panel.js")) : null;
-function addCliSkillsPanel(html) {
-  if (!cliSkillsScript || html.includes(`src="${CLI_SKILLS_SCRIPT_PATH}"`)) return html;
-  return html.replace(/<\/head\s*>/i, `<script defer src="${CLI_SKILLS_SCRIPT_PATH}"></script></head>`);
-}
 const officialAssets = runtime.managed
   ? createOfficialAssets(process.env.CLAUDE_LOCAL_DESKTOP_RESOURCES)
   : null;
@@ -85,7 +76,7 @@ function addLocalizationShim(html, officialLocales) {
 }
 
 const officialShell = runtime.managed
-  ? addCliSkillsPanel(addLocalizationShim(officialAssets.indexHtml, officialAssets.i18nLocales))
+  ? addLocalizationShim(officialAssets.indexHtml, officialAssets.i18nLocales)
   : null;
 const args = process.argv.slice(2);
 const arg = (name, fallback) => {
@@ -1378,8 +1369,7 @@ function readDocShell(host) {
 // 绝不回放登出落地页桩体——那会让 SPA 永远卡在骨架屏。
 function serveDocShell(req, res, url) {
   const host = url.host || "claude.ai";
-  const cachedBody = readDocShell(host);
-  const cached = cachedBody ? Buffer.from(addCliSkillsPanel(cachedBody.toString("utf8"))) : null;
+  const cached = readDocShell(host);
   if (cached) {
     res.writeHead(200, {
       "content-type": "text/html; charset=utf-8",
@@ -1416,12 +1406,11 @@ function serveDocShell(req, res, url) {
             JSON.stringify({ status: 200, headers: { "content-type": "text/html" }, url: `${host}/epitaxy` }),
           );
         }
-        const responseBody = r.statusCode === 200 ? Buffer.from(addCliSkillsPanel(body.toString("utf8"))) : body;
         res.writeHead(r.statusCode || 502, {
           "content-type": "text/html; charset=utf-8",
-          "content-length": responseBody.length,
+          "content-length": body.length,
         });
-        res.end(responseBody);
+        res.end(body);
       });
     },
   );
@@ -1627,27 +1616,6 @@ function handle(req, res, hostHeader) {
 
   const hostName = url.hostname.toLowerCase();
   const isMainClaudeHost = /^(claude\.ai|www\.claude\.ai|claude\.com|www\.claude\.com)$/.test(hostName);
-  if (runtime.managed && url.pathname.startsWith("/__claudemom/")) {
-    if (!isMainClaudeHost || req.method !== "GET" ||
-        (req.headers.origin && req.headers.origin !== url.origin) ||
-        req.headers["sec-fetch-site"] === "cross-site") {
-      return json(res, { error: "Local read-only resource unavailable" }, 403);
-    }
-    if (url.pathname === CLI_SKILLS_SCRIPT_PATH && cliSkillsScript) {
-      res.writeHead(200, {
-        "content-type": "text/javascript; charset=utf-8", "content-length": cliSkillsScript.length,
-        "cache-control": "no-store", "x-content-type-options": "nosniff",
-      });
-      return res.end(cliSkillsScript);
-    }
-    if (url.pathname === "/__claudemom/cli-skills") {
-      return void listCliSkills(cliSkillsDirectory).then((result) => json(res, {
-        ...result,
-        directoryLabel: process.env.CLAUDE_LOCAL_CODE_SHARE_HOME === "1" ? "~/.claude/skills" : "Code 独立配置目录中的 skills",
-      }));
-    }
-    return json(res, { error: "Local resource not found" }, 404);
-  }
   if (MODE === "mock" && req.method === "GET" &&
       (isMainClaudeHost || hostName === "api.anthropic.com") &&
       /^\/api\/(?:organizations\/[^/]+\/)?model_selector\/[^/]+\/?$/.test(url.pathname)) {

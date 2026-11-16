@@ -179,7 +179,7 @@ before(async () => {
     "audio/tone.mp3": Buffer.from([0x49, 0x44, 0x33]),
   });
   fs.mkdirSync(path.join(root, "runtime", "scripts"), { recursive: true });
-  for (const file of ["proxy.mjs", "conversation-service.mjs", "rpc.mjs", "runtime.mjs", "official-assets.mjs", "cli-skills.mjs", "cli-skills-panel.js", "scripts/patch-dictation-start.mjs"]) {
+  for (const file of ["proxy.mjs", "conversation-service.mjs", "rpc.mjs", "runtime.mjs", "official-assets.mjs", "scripts/patch-dictation-start.mjs"]) {
     fs.copyFileSync(path.join(here, file), path.join(root, "runtime", file));
   }
   fs.copyFileSync(
@@ -277,6 +277,9 @@ test("fresh managed profile serves the installed official shell and bounded ASAR
   const routeHtml = route.bytes.toString("utf8");
   assert.match(routeHtml, /data-build-id="fixture-build"/);
   assert.equal([...routeHtml.matchAll(/<script src="\/__codex_plus\/claude-localization\.js"><\/script>/g)].length, 1);
+  const customize = await request(service, "/customize/skills/yours", { host: "claude.ai" });
+  assert.equal(customize.status, 200);
+  assert.doesNotMatch(customize.bytes.toString("utf8"), /__claudemom\/cli-skills|claudemom-cli-skills/);
 
   for (const [host, pathname] of [
     ["claude.ai", "/i18n/zh-Hans.json?v=1.1"],
@@ -549,45 +552,6 @@ test("installed template turns on the Cowork GrowthBook gate unless disabled", a
   }
   const off = await features({ CLAUDE_LOCAL_COWORK: "0" });
   assert.deepEqual(off.features["574905726"], { defaultValue: false });
-});
-
-test("CLI Skills panel exposes only directory metadata and rejects cross-site or mutating requests", async () => {
-  const directory = path.join(root, "cli-skills");
-  fs.mkdirSync(path.join(directory, "my-skill"), { recursive: true });
-  const content = "---\nname: my-skill\n---\nprivate instructions stay on disk";
-  fs.writeFileSync(path.join(directory, "my-skill", "SKILL.md"), content);
-  const instance = await start({
-    CLAUDE_LOCAL_CLI_SKILLS_DIR: directory,
-    CLAUDE_LOCAL_CODE_SHARE_HOME: "1",
-  });
-  try {
-    const result = await request(instance, "/__claudemom/cli-skills?path=/etc", { host: "claude.ai" });
-    assert.equal(result.status, 200);
-    assert.equal(result.json.directoryLabel, "~/.claude/skills");
-    assert.equal(result.json.available, true);
-    assert.deepEqual(result.json.skills.map((skill) => skill.directoryName), ["my-skill"]);
-    assert.equal(result.bytes.includes(Buffer.from(directory)), false);
-    assert.equal(result.bytes.includes(Buffer.from("private instructions")), false);
-    const shell = await request(instance, "/customize/skills/yours", { host: "claude.ai" });
-    assert.equal(shell.bytes.toString().match(/src="\/__claudemom\/cli-skills.js"/g)?.length, 1);
-    const script = await request(instance, "/__claudemom/cli-skills.js", { host: "claude.ai" });
-    assert.equal(script.status, 200);
-    assert.match(script.headers["content-type"], /javascript/);
-    for (const options of [
-      { method: "POST", body: {} },
-      { extraHeaders: { origin: "https://untrusted.invalid" } },
-      { extraHeaders: { "sec-fetch-site": "cross-site" } },
-      { host: "assets-proxy.anthropic.com" },
-    ]) {
-      const denied = await request(instance, "/__claudemom/cli-skills", { host: "claude.ai", ...options });
-      assert.equal(denied.status, 403);
-      assert.equal(denied.headers["access-control-allow-origin"], undefined);
-    }
-    assert.equal((await request(instance, "/__claudemom/cli-skills/../../settings.json", { host: "claude.ai" })).bytes.includes(Buffer.from(content)), false);
-    assert.equal(fs.readFileSync(path.join(directory, "my-skill", "SKILL.md"), "utf8"), content);
-  } finally {
-    await stop(instance);
-  }
 });
 
 test("clean managed runtime uses synthetic bootstrap and configured catalogs without private recordings", async () => {
