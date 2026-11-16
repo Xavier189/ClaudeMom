@@ -499,12 +499,14 @@ fn parse_models(body: &str) -> Result<Vec<UpstreamModel>> {
         }
         models.push(UpstreamModel {
             id: id.to_string(),
-            display_name: entry
-                .get("display_name")
-                .and_then(Value::as_str)
-                .map(str::trim)
-                .filter(|name| !name.is_empty() && *name != id)
-                .map(str::to_string),
+            display_name: ["magpie_label", "display_name"].into_iter().find_map(|field| {
+                entry
+                    .get(field)
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|name| !name.is_empty() && *name != id)
+                    .map(str::to_string)
+            }),
             context_window: entry.get("context_window").and_then(Value::as_u64).filter(|v| *v > 0),
         });
     }
@@ -724,6 +726,8 @@ mod tests {
         let models = parse_models(
             &json!({"data": [
                 {"id": "a/claude-opus", "context_window": 1_000_000, "display_name": "Claude Opus · A"},
+                {"id": "agentrouter/gpt-6.1-sol", "display_name": "GPT-6.1 Sol", "magpie_label": "GPT-6.1 Sol · AgentRouter"},
+                {"id": "zed/gpt-6.1-sol", "display_name": "GPT-6.1 Sol · Zed", "magpie_label": "zed/gpt-6.1-sol"},
                 {"id": "b/glm-5"},
                 {"id": "b/glm-5"},
                 {"id": ""}
@@ -735,6 +739,8 @@ mod tests {
             models,
             [
                 UpstreamModel { id: "a/claude-opus".into(), display_name: Some("Claude Opus · A".into()), context_window: Some(1_000_000) },
+                UpstreamModel { id: "agentrouter/gpt-6.1-sol".into(), display_name: Some("GPT-6.1 Sol · AgentRouter".into()), context_window: None },
+                UpstreamModel { id: "zed/gpt-6.1-sol".into(), display_name: Some("GPT-6.1 Sol · Zed".into()), context_window: None },
                 UpstreamModel { id: "b/glm-5".into(), display_name: None, context_window: None },
             ]
         );
