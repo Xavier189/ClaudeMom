@@ -76,7 +76,25 @@ node scripts/relaunch-local.mjs    # 构建并重启本地实例（在仓库根�
 核心的 Node 测试：`cd crates/claude-local/runtime && node --test managed.test.mjs proxy.test.mjs`
 （需要本地测试证书：`scripts/gen-ca.sh`）。
 
-保留本地修复并跟随作者版本更新，见[本地维护与打包](docs/local-maintenance.md)。macOS 上可运行 `node scripts/build-local.mjs` 完成验证与打包；安装步骤见维护手册。
+## 个人 Fork 维护规则
+
+本仓库采用双远端与双主分支模式维护个人定制版本，统一工作分支为 `personal`：
+
+| 项目 | 约定 | 说明 |
+| --- | --- | --- |
+| `origin` | `Xavier189/ClaudeMom` | 个人 Fork，推送 `main`、`personal` 与 `local/verified-*` 标签 |
+| `upstream` | `BigPizzaV3/ClaudeMom` | 作者上游仓库，只拉取更新并禁用推送（`pushurl = no_push`） |
+| `main` | 上游干净镜像 | 仅通过 `git merge --ff-only upstream/main` 同步，不在该分支提交定制改动 |
+| `personal` | 长期个人主线 | 存放全部个人改造，使用 `git merge --no-edit upstream/main` 接入上游更新（不改写已打标签历史） |
+
+日常操作规则：
+
+1. **同步上游**：在 `main` 快进合并 `upstream/main` 并推送到 `origin/main`；切回 `personal` 合并 `upstream/main`，排查冲突与同类修复后再打包。
+2. **验证与打包**：在 `personal` 运行 `node scripts/build-local.mjs`，安装验收后打 `local/verified-YYYYMMDD-HHMMSS` 标签并显式推送到 `origin`。
+3. **跨平台 CI（可选）**：[ci.yml](.github/workflows/ci.yml) 只监听 `main` 与 `pull_request`；在 `Xavier189/ClaudeMom` 保留一个 `personal -> main` 的长期草稿 PR 即可直观查看总 Diff 并触发双平台检查。
+4. **禁止操作**：不点击应用内更新（仍指向上游 Release），不运行 [release.mjs](scripts/release.mjs)，不向个人 Fork 推送 `v*` 标签（[release.yml](.github/workflows/release.yml) 缺少 Apple 公证与签名密钥会失败）。
+
+完整命令、远端初始化、向作者提纯净 PR 与回滚步骤见 [个人 Fork 维护与本地打包指南](docs/local-maintenance.md)。
 
 ## 许可
 
