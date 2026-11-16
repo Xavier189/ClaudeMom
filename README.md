@@ -76,6 +76,8 @@ node scripts/relaunch-local.mjs    # 构建并重启本地实例（在仓库根�
 核心的 Node 测试：`cd crates/claude-local/runtime && node --test managed.test.mjs proxy.test.mjs`
 （需要本地测试证书：`scripts/gen-ca.sh`）。
 
+保留本地修复并跟随作者版本更新，见[本地维护与打包](docs/local-maintenance.md)。macOS 上可运行 `node scripts/build-local.mjs` 完成验证与打包；安装步骤见维护手册。
+
 ## 许可
 
 AGPL-3.0-only

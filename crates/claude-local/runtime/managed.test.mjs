@@ -17,6 +17,7 @@ import { createOfficialAssets } from "./official-assets.mjs";
 import { createStateStore, dropUnroutedModels, gatewayModel, gatewayTarget, modelLabel, modelSelectors, modelWindow, planProfile, runtimeConfig } from "./runtime.mjs";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
+const testCaDir = process.env.CLAUDE_LOCAL_TEST_CA_DIR || path.join(here, "ca");
 const modelIds = ["alpha/claude-opus-4-6", "beta/gpt-6", "gamma/grok-4", "alpha/shared", "beta/shared"];
 const modelWindows = {
   [modelIds[0]]: 1_000_000, [modelIds[1]]: 1_100_000, [modelIds[2]]: 256_000,
@@ -72,7 +73,7 @@ async function request(instance, pathname, { host, body, type = "application/jso
     connect.end();
     const [response, socket] = await once(connect, "connect");
     assert.equal(response.statusCode, 200);
-    const secure = tls.connect({ socket, servername: host, ca: fs.readFileSync(path.join(here, "ca/ca.pem")) });
+    const secure = tls.connect({ socket, servername: host, ca: fs.readFileSync(path.join(testCaDir, "ca.pem")) });
     await once(secure, "secureConnect");
     agent = new https.Agent({ keepAlive: false });
     agent.createConnection = () => secure;
@@ -106,7 +107,7 @@ async function request(instance, pathname, { host, body, type = "application/jso
 async function start(extra = {}, runtimeDir = path.join(root, "runtime")) {
   const ready = path.join(root, "ready.json");
   const instanceId = `managed-test-${Date.now()}`;
-  const child = spawn(process.execPath, [path.join(runtimeDir, "proxy.mjs"), "--port", "0", "--mode", "mock", "--log", "0", "--ca", path.join(here, "ca")], {
+  const child = spawn(process.execPath, [path.join(runtimeDir, "proxy.mjs"), "--port", "0", "--mode", "mock", "--log", "0", "--ca", testCaDir], {
     env: {
       ...process.env,
       CLAUDE_LOCAL_MANAGED: "1",
