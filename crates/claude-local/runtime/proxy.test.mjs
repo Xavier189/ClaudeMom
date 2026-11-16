@@ -33,6 +33,7 @@ let dictationCacheDir;
 let dictationAssetPath;
 let dictationUpgrade;
 let dictationFrame;
+let finishDownload;
 
 async function listen(server) {
   server.listen(0, "127.0.0.1");
@@ -101,7 +102,7 @@ async function request(pathname, { host, body, method = body === undefined ? "GE
   }
 }
 
-async function requestText(host, pathname, headers = {}) {
+async function requestText(host, pathname, headers = {}, onData) {
   const connect = http.request({
     hostname: "127.0.0.1", port: proxyPort, method: "CONNECT", path: `${host}:443`,
   });
@@ -124,7 +125,7 @@ async function requestText(host, pathname, headers = {}) {
       req.on("response", (response) => {
         const chunks = [];
         response.on("error", reject);
-        response.on("data", (chunk) => chunks.push(chunk));
+        response.on("data", (chunk) => { chunks.push(chunk); onData?.(chunk); });
         response.on("end", () => resolve({
           status: response.statusCode,
           headers: response.headers,
@@ -307,6 +308,17 @@ before(async () => {
   // 假上游：记录代理转发过来的 host 头与路径
   upstreamFixture = http.createServer((req, res) => {
     upstreamRequests.push({ host: req.headers.host, url: req.url });
+    if (req.url === "/claude-code-releases/fixture/claude.zst") {
+      const first = Buffer.from([0x28, 0xb5, 0x2f, 0xfd]), last = Buffer.from("bundle");
+      res.writeHead(206, {
+        "content-type": "application/octet-stream", "content-length": first.length + last.length,
+        "content-range": `bytes 0-${first.length + last.length - 1}/100`,
+        "accept-ranges": "bytes",
+      });
+      finishDownload = () => res.end(last);
+      res.write(first);
+      return;
+    }
     if (req.url === cdnAssetPath) {
       res.writeHead(200, {
         "content-type": "text/javascript; charset=utf-8",
@@ -693,6 +705,28 @@ test("hashed CDN assets replay cached compressed bytes before contacting the ups
     assert.equal(result.headers["x-fixture-hop"], undefined);
     assert.equal(Number(result.headers["content-length"]), cdnAssetBody.length);
     assert.equal(gunzipSync(result.bytes).toString("utf8"), 'export const fixture = "cached CDN bytes";');
+  }
+});
+
+test("Code downloads deliver the first bytes before the upstream completes", async () => {
+  let firstChunk;
+  const first = new Promise((resolve) => { firstChunk = resolve; });
+  const pending = requestText("downloads.claude.ai", "/claude-code-releases/fixture/claude.zst", { range: "bytes=0-9" }, firstChunk);
+  let timeout;
+  try {
+    const bytes = await Promise.race([
+      first,
+      new Promise((_, reject) => { timeout = setTimeout(() => reject(new Error("download was buffered until completion")), 2000); }),
+    ]);
+    assert.deepEqual(bytes, Buffer.from([0x28, 0xb5, 0x2f, 0xfd]));
+  } finally {
+    clearTimeout(timeout);
+    finishDownload?.();
+    const result = await pending;
+    assert.equal(result.status, 206);
+    assert.equal(result.headers["content-range"], "bytes 0-9/100");
+    assert.equal(result.headers["accept-ranges"], "bytes");
+    assert.deepEqual(result.bytes, Buffer.concat([Buffer.from([0x28, 0xb5, 0x2f, 0xfd]), Buffer.from("bundle")]));
   }
 });
 

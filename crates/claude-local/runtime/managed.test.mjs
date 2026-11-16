@@ -9,6 +9,7 @@ import os from "node:os";
 import path from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import tls from "node:tls";
+import { gzipSync } from "node:zlib";
 import { fileURLToPath } from "node:url";
 import { after, before, test } from "node:test";
 import { decode, get, asMsg, asStr, ld, vi } from "./rpc.mjs";
@@ -24,6 +25,7 @@ const modelWindows = {
 let root;
 let gateway;
 let gatewayPort;
+let gatewayFailure = false;
 let service;
 const received = [];
 
@@ -199,6 +201,10 @@ before(async () => {
     for await (const chunk of req) chunks.push(chunk);
     const raw = Buffer.concat(chunks).toString("utf8");
     received.push({ path: req.url, headers: req.headers, body: raw ? JSON.parse(raw) : null });
+    if (gatewayFailure) {
+      res.writeHead(502, { "content-type": "application/json" });
+      return res.end(JSON.stringify({ error: { message: "fixture upstream failure" } }));
+    }
     res.writeHead(200, { "content-type": "text/event-stream" });
     res.end('data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"gateway reply"}}\n\ndata: {"type":"message_stop"}\n\n');
   });
@@ -651,6 +657,79 @@ test("RPC sends preserve model choice, switching, complete history and restart s
   assert.equal(prefs.json.preferences.feature_preference.complete.enable_email, false);
   assert.equal(service.output().includes("first test"), false);
   assert.equal(service.output().includes("test-local-gateway-token"), false);
+});
+
+test("REST conversation details contain messages and keep the reply leaf after restart", async () => {
+  const base = "/api/organizations/local/chat_conversations";
+  const created = await request(service, base, { host: "claude.ai", body: {} });
+  assert.equal(created.status, 201);
+  assert.deepEqual(created.json.chat_messages, []);
+  const detailPath = `${base}/${created.json.uuid}`;
+  const empty = await request(service, detailPath, { host: "claude.ai" });
+  assert.deepEqual(empty.json.chat_messages, []);
+  const human = crypto.randomUUID(), assistant = crypto.randomUUID();
+  const reply = await request(service, `${detailPath}/completion`, {
+    host: "claude.ai", extraHeaders: { "content-encoding": "gzip" }, body: gzipSync(JSON.stringify({
+      prompt: "REST 对话测试", model: modelIds[1],
+      turn_message_uuids: { human_message_uuid: human, assistant_message_uuid: assistant },
+    })),
+  });
+  assert.match(reply.bytes.toString(), /gateway reply/);
+  assert.match(reply.bytes.toString(), /content_block_stop/);
+  assert.equal(received.at(-1).body.model, modelIds[1]);
+  assert.deepEqual(received.at(-1).body.messages, [{ role: "user", content: "REST 对话测试" }]);
+  const nextHuman = crypto.randomUUID(), nextAssistant = crypto.randomUUID();
+  await request(service, `${detailPath}/completion`, {
+    host: "claude.ai", body: {
+      prompt: "second turn", model: modelIds[1], parent_message_uuid: assistant,
+      turn_message_uuids: { human_message_uuid: nextHuman, assistant_message_uuid: nextAssistant },
+    },
+  });
+  assert.deepEqual(received.at(-1).body.messages, [
+    { role: "user", content: "REST 对话测试" }, { role: "assistant", content: "gateway reply" },
+    { role: "user", content: "second turn" },
+  ]);
+  const verify = async () => {
+    const detail = await request(service, detailPath, { host: "claude.ai" });
+    assert.deepEqual(detail.json.chat_messages.map((m) => [m.uuid, m.sender, m.text]), [
+      [human, "human", "REST 对话测试"], [assistant, "assistant", "gateway reply"],
+      [nextHuman, "human", "second turn"], [nextAssistant, "assistant", "gateway reply"],
+    ]);
+    assert.equal(detail.json.current_leaf_message_uuid, nextAssistant);
+    assert.equal(detail.json.model, modelIds[1]);
+    for (const message of detail.json.chat_messages) {
+      assert.deepEqual(message.attachments, []);
+      assert.deepEqual(message.files, []);
+      assert.deepEqual(message.sync_sources, []);
+    }
+    assert.equal(detail.json.chat_messages[1].parent_message_uuid, human);
+    assert.equal(detail.json.chat_messages[2].parent_message_uuid, assistant);
+  };
+  await verify();
+  await stop(service);
+  service = await start();
+  await verify();
+});
+
+test("malformed compressed completions do not create empty messages and gateway failures surface", async () => {
+  const base = "/api/organizations/local/chat_conversations";
+  const created = await request(service, base, { host: "claude.ai", body: {} });
+  const detail = `${base}/${created.json.uuid}`;
+  const before = received.length;
+  for (const body of [Buffer.from("invalid gzip"), gzipSync("not json"), gzipSync("{}")]) {
+    const result = await request(service, `${detail}/completion`, {
+      host: "claude.ai", body, extraHeaders: { "content-encoding": "gzip" },
+    });
+    assert.equal(result.status, 400);
+  }
+  assert.equal(received.length, before);
+  assert.deepEqual((await request(service, detail, { host: "claude.ai" })).json.chat_messages, []);
+  gatewayFailure = true;
+  try {
+    const result = await request(service, `${detail}/completion`, { host: "claude.ai", body: { prompt: "failure test" } });
+    assert.match(result.bytes.toString(), /event: error/);
+    assert.match(result.bytes.toString(), /HTTP 502/);
+  } finally { gatewayFailure = false; }
 });
 
 test("managed SIGTERM and stdin closure flush state and release the listener", async () => {

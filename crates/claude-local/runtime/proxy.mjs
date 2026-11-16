@@ -22,6 +22,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import crypto from "node:crypto";
+import { gunzipSync } from "node:zlib";
 import { fileURLToPath } from "node:url";
 import { createConversationService } from "./conversation-service.mjs";
 import { isPatchedStartupAsset, startupAssets } from "./scripts/patch-dictation-start.mjs";
@@ -752,9 +753,16 @@ function convToRest(c) {
     model: c.model || runtime.model,
     created_at: c.created_at,
     updated_at: c.updated_at,
-    current_leaf_message_uuid: c.leafMessageId || null,
+    current_leaf_message_uuid: c.current_leaf_message_uuid || c.leafMessageId || null,
     live_status: live ? "running" : null,
     last_settled_at: live ? null : c.updated_at,
+  };
+}
+
+function conversationDetail(c) {
+  return {
+    ...convToRest(c),
+    chat_messages: c.chat_messages.map((message) => ({ attachments: [], files: [], sync_sources: [], ...message })),
   };
 }
 
@@ -777,7 +785,7 @@ function mockApi(req, res, url) {
 
   const convGet = p.match(/\/chat_conversations\/([0-9a-f-]{36})$/);
   if (convGet && method === "GET") {
-    return json(res, convToRest(ensureConv(convGet[1])));
+    return json(res, conversationDetail(ensureConv(convGet[1])));
   }
 
   // 会话列表：静态模板 + 运行期动态会话（RPC 建的）合并，按更新时间倒序
@@ -1126,26 +1134,35 @@ function mockApi(req, res, url) {
     if (method === "POST") {
       const id = crypto.randomUUID();
       const conv = ensureConv(id);
-      return json(res, convToRest(conv), 201);
+      return json(res, conversationDetail(conv), 201);
     }
   }
   const convMatch = p.match(/\/chat_conversations\/([^/]+)$/);
   if (convMatch) {
-    if (CONV_STATE.has(convMatch[1])) return json(res, convToRest(ensureConv(convMatch[1])));
+    if (CONV_STATE.has(convMatch[1])) return json(res, conversationDetail(ensureConv(convMatch[1])));
     return json(res, { error: "not found" }, 404);
   }
   if (/\/completion$/.test(p)) {
-    let raw = "";
-    req.on("data", (c) => (raw += c));
-    req.on("end", () => {
-      let body = {};
-      try { body = JSON.parse(raw); } catch {}
+    readBody(req, (raw) => {
+      const encoding = String(req.headers["content-encoding"] || "identity").toLowerCase();
+      if (!["identity", "gzip"].includes(encoding)) return json(res, { error: "Unsupported content encoding" }, 415);
+      let body;
+      try {
+        const decoded = encoding === "gzip" ? gunzipSync(raw, { maxOutputLength: 8 * 1024 * 1024 }) : raw;
+        body = JSON.parse(decoded.toString("utf8"));
+        if (!body || typeof body !== "object" || typeof body.prompt !== "string") throw new Error("Invalid prompt");
+      } catch { return json(res, { error: "Invalid completion request" }, 400); }
       const prompt = typeof body.prompt === "string" ? body.prompt : "";
       const human = body.turn_message_uuids?.human_message_uuid || crypto.randomUUID();
       const asst = body.turn_message_uuids?.assistant_message_uuid || crypto.randomUUID();
       const model = gatewayModel(runtime, body.model || process.env.GATEWAY_MODEL);
       const sendEv = (ev, obj) => {
         res.write(`event: ${ev}\ndata: ${JSON.stringify(obj)}\n\n`);
+      };
+      const fail = (message) => {
+        if (res.destroyed || res.writableEnded) return;
+        sendEv("error", { type: "error", error: { type: "api_error", message } });
+        res.end();
       };
       res.writeHead(200, {
         "content-type": "text/event-stream; charset=utf-8",
@@ -1159,8 +1176,9 @@ function mockApi(req, res, url) {
       sendEv("content_block_start", { type: "content_block_start", index: 0, content_block: { type: "text", text: "" } });
       const convUuid = (p.match(/\/chat_conversations\/([0-9a-f-]{36})\/completion/) || [])[1];
       const conv = convUuid ? ensureConv(convUuid) : null;
+      if (conv) conv.model = model;
       if (conv && !conv.chat_messages.some((m) => m.uuid === human)) {
-        pushMessage(conv, { uuid: human, sender: "human", text: prompt });
+        pushMessage(conv, { uuid: human, sender: "human", text: prompt, parent: body.parent_message_uuid });
       }
       let acc = "";
       const payload = JSON.stringify({
@@ -1178,6 +1196,7 @@ function mockApi(req, res, url) {
           port: target.port || (target.protocol === "https:" ? 443 : 80),
           path: target.pathname + target.search,
           method: "POST",
+          timeout: 300000,
           headers: {
             "content-type": "application/json",
             "x-api-key": runtime.key,
@@ -1187,7 +1206,12 @@ function mockApi(req, res, url) {
           },
         },
         (gres) => {
+          if (gres.statusCode >= 400) {
+            gres.resume();
+            return fail(`Model gateway returned HTTP ${gres.statusCode}`);
+          }
           let buf = "";
+          gres.setEncoding("utf8");
           gres.on("data", (chunk) => {
             buf += chunk.toString("utf8");
             let i;
@@ -1206,19 +1230,22 @@ function mockApi(req, res, url) {
                   pushMessage(conv, { uuid: asst, sender: "assistant", parent: human, text: acc, stop_reason: "end_turn" });
                   stateStore.flush();
                 }
+                sendEv("content_block_stop", { type: "content_block_stop", index: 0 });
                 sendEv("message_delta", { type: "message_delta", delta: { stop_reason: "end_turn" } });
                 sendEv("message_stop", { type: "message_stop" });
                 res.end();
               }
             }
           });
+          gres.on("error", () => fail("Model gateway stream interrupted"));
           gres.on("end", () => { try { res.end(); } catch {} });
         },
       );
       greq.on("error", (e) => {
-        sendEv("error", { type: "error", error: { message: e.message } });
-        try { res.end(); } catch {}
+        fail(e.message);
       });
+      greq.on("timeout", () => greq.destroy(new Error("Model gateway timeout")));
+      res.once("close", () => { if (!res.writableFinished) greq.destroy(); });
       greq.end(payload);
     });
     return;
@@ -1259,12 +1286,17 @@ function isHashedStaticAsset(req, url) {
     /\/[^/]+-[A-Za-z0-9_-]{8,}\.(?:m?js|css|wasm|woff2?|ttf|otf|png|jpe?g|webp|gif|svg|ico)$/.test(url.pathname);
 }
 
-function bufferedResponseHeaders(headers, length) {
+function responseHeaders(headers) {
   const result = { ...headers };
   const connectionHeaders = String(result.connection || "").split(",").map((name) => name.trim().toLowerCase());
   for (const name of ["connection", "transfer-encoding", "keep-alive", "proxy-authenticate", "proxy-authorization", "te", "trailer", "upgrade", ...connectionHeaders]) {
     delete result[name];
   }
+  return result;
+}
+
+function bufferedResponseHeaders(headers, length) {
+  const result = responseHeaders(headers);
   // Buffer 未解压，保留 content-encoding 并以实际传输字节数更新长度。
   result["content-length"] = length;
   return result;
@@ -1488,7 +1520,17 @@ function proxyUpstream(req, res, url) {
       timeout: 20000,
     },
     (up) => {
+      // 安装包可能需要下载几分钟；立即转发数据，避免客户端的无数据超时，也不在内存里攒整个文件。
+      if (!canCache) {
+        res.writeHead(up.statusCode, responseHeaders(up.headers));
+        res.flushHeaders();
+        up.on("error", () => res.destroy());
+        res.once("close", () => { if (!up.complete) upstreamReq.destroy(); });
+        up.pipe(res);
+        return;
+      }
       const chunks = [];
+      up.on("error", () => res.destroy());
       up.on("data", (c) => chunks.push(c));
       up.on("end", () => {
         const body = Buffer.concat(chunks);
@@ -1513,6 +1555,7 @@ function proxyUpstream(req, res, url) {
   );
   upstreamReq.on("timeout", () => upstreamReq.destroy(new Error("upstream timeout")));
   upstreamReq.on("error", (err) => {
+    if (res.headersSent) return res.destroy();
     if (serveCachedStaticAsset(req, res, url)) return;
     // 动态接口不能回放其它会话的缓存；文档仍沿用本地外壳兜底。
     if (canCache && document && fs.existsSync(cp) && fs.existsSync(metaPath)) {
@@ -1534,6 +1577,7 @@ function proxyUpstream(req, res, url) {
     res.writeHead(502, { "content-type": "text/plain; charset=utf-8" });
     res.end(`upstream unavailable: ${err.message}\n`);
   });
+  res.once("close", () => { if (!res.writableFinished) upstreamReq.destroy(); });
   req.pipe(upstreamReq);
 }
 
