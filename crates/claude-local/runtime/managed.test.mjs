@@ -554,6 +554,42 @@ test("installed template turns on the Cowork GrowthBook gate unless disabled", a
   assert.deepEqual(off.features["574905726"], { defaultValue: false });
 });
 
+test("managed cloud skills inventory excludes unavailable archives while explicit replay keeps recorded skills", async () => {
+  const inventoryPath = "/api/organizations/local/skills/list-skills";
+  const downloadPath = "/api/organizations/local/skills/download-dot-skill-file?skill_id=recorded-skill";
+  const synthetic = await request(service, inventoryPath, { host: "claude.ai" });
+  assert.equal(synthetic.status, 200);
+  assert.deepEqual(synthetic.json, { skills: [] });
+  const unavailable = await request(service, downloadPath, { host: "claude.ai" });
+  assert.equal(unavailable.status, 404);
+  assert.equal(unavailable.json.error.type, "not_found_error");
+
+  const runtimeDir = path.join(root, "skills-runtime");
+  fs.cpSync(path.join(root, "runtime"), runtimeDir, { recursive: true });
+  fs.mkdirSync(path.join(runtimeDir, ".cache"), { recursive: true });
+  fs.writeFileSync(path.join(runtimeDir, "mock", ".codex-plus-template"), "");
+  const recordedSkills = { skills: [{ id: "recorded-skill", name: "recorded-skill", enabled: true }] };
+  fs.writeFileSync(path.join(runtimeDir, "mock", "api", "skills.json"), JSON.stringify(recordedSkills));
+
+  for (const extra of [
+    {},
+    { CLAUDE_LOCAL_RECORDED_DIR: runtimeDir },
+    { CLAUDE_LOCAL_MANAGED: "0" },
+  ]) {
+    const instance = await start({ CLAUDE_LOCAL_CACHE_DIR: path.join(runtimeDir, ".cache"), ...extra }, runtimeDir);
+    try {
+      const production = !extra.CLAUDE_LOCAL_RECORDED_DIR && extra.CLAUDE_LOCAL_MANAGED !== "0";
+      const inventory = await request(instance, inventoryPath, { host: "claude.ai" });
+      assert.equal(inventory.status, 200);
+      assert.deepEqual(inventory.json, production ? { skills: [] } : recordedSkills);
+      const download = await request(instance, downloadPath, { host: "claude.ai" });
+      assert.equal(download.status, production ? 404 : 204);
+    } finally {
+      await stop(instance, extra.CLAUDE_LOCAL_MANAGED === "0");
+    }
+  }
+});
+
 test("clean managed runtime uses synthetic bootstrap and configured catalogs without private recordings", async () => {
   for (const pathname of ["/edge-api/bootstrap", "/api/bootstrap", "/api/bootstrap/local/app_start"]) {
     const result = await request(service, pathname, { host: "claude.ai" });

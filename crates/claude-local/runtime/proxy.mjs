@@ -831,6 +831,8 @@ function mockApi(req, res, url) {
   ];
   for (const [re, slug] of apiMap) {
     if (re.test(p)) {
+      // 内嵌模板只有云端 Skills 元数据，没有可下载的归档；原生同步器会重试每个 enabled 条目。
+      if (slug === "skills" && runtime.managed && !runtime.recordedDir) return json(res, { skills: [] });
       const f = path.join(POC_MOCK, "api", `${slug}.json`);
       if (!dataManaged && fs.existsSync(f)) {
         try {
@@ -1116,6 +1118,9 @@ function mockApi(req, res, url) {
     return json(res, { settings: {}, entries: [], items: [] });
   }
   if (/\/skills\/download-dot-skill-file/.test(p)) {
+    if (runtime.managed && !runtime.recordedDir) {
+      return json(res, { error: { type: "not_found_error", message: "Cloud skill archive is unavailable in local mode" } }, 404);
+    }
     // 区域封锁拿不到真 zip；回空 body 让下载器安静失败而不是 parse 报错
     res.writeHead(204, { "content-length": 0 });
     return res.end();
