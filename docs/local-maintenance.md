@@ -47,7 +47,7 @@ git config core.hooksPath .githooks
 
 ### 1. 自动发现与预合并（云端每日执行 + 支持手动触发）
 
-[.github/workflows/upstream-sync.yml](../.github/workflows/upstream-sync.yml) 每天北京时间 09:17 自动运行（也可执行 `gh workflow run upstream-sync.yml` 立即触发）：
+[.github/workflows/upstream-sync.yml](../.github/workflows/upstream-sync.yml) 每天北京时间 09:17 自动运行（也可执行 `gh workflow run upstream-sync.yml` 触发云端任务，或直接在本机运行 `node scripts/sync-upstream.mjs` 立即执行同等同步逻辑）：
 
 1. 自动将 `origin/upstream-main` 快进更新至 `BigPizzaV3/ClaudeMom:main`。
 2. 若 `main` 尚未包含最新上游提交，在 `sync/upstream-main` 尝试合并 `origin/main` 与最新上游：
@@ -85,6 +85,7 @@ node scripts/verify-pr.mjs <PR编号>
 - 输入 `pass`：自动备份 `~/.claude-mom` 与旧 `/Applications/ClaudeMom.app`，安装新包，向 GitHub 上报 `local-verified = success`，执行 Merge Commit 合入 `main`，并在新主线提交上打 `local/verified-YYYYMMDD-HHMMSS` 标签推送到 `origin`。
 - 输入 `fail <原因>`：保留原 `/Applications/ClaudeMom.app` 不变，向 GitHub 上报 `local-verified = failure`，将 PR 退回草稿并自动留言失败原因供 Agent 继续修复。
 - 纯文档/工作流治理 PR（未触碰 `apps/`、`crates/`、`Cargo.*`）可使用 `node scripts/verify-pr.mjs <PR编号> --non-runtime`（仍强制执行全套本地单测与类型检查）。
+- 若云端 GitHub Actions Runner 暂不可用，可追加 `--local-ci` 在本机隔离 worktree 内完整跑完不变量与测试套件并上报 `ci-gate`。
 
 - **向作者上游提交纯净 PR**：不要从 `main` 直接向 `BigPizzaV3/ClaudeMom` 提 PR。从同步后的 `origin/upstream-main` 新建临时分支，只 `git cherry-pick <commit>` 通用修复提交后再提 PR。
 

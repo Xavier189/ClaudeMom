@@ -46,7 +46,10 @@ node --test scripts/*.test.mjs
 # 2. 代码改动必跑（macOS / 具备 Rust + Node 22 环境时）：前端 + Rust + Node 全套检查（不打包）
 node scripts/build-local.mjs --check-only
 
-# 3. 维护者本机最终签收并合入 main（云端 CI 绿灯后在本机终端执行）
+# 3. 手动触发上游同步（云端 Actions 未启用或需立即检查时在本机运行）
+node scripts/sync-upstream.mjs
+
+# 4. 维护者本机最终签收并合入 main（云端 CI 绿灯后在本机终端执行；若云端 Runner 暂不可用可追加 --local-ci）
 node scripts/verify-pr.mjs <PR编号>
 ```
 
