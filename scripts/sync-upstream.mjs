@@ -72,9 +72,17 @@ function writeGithubOutputs(values) {
   fs.appendFileSync(outPath, `${lines.join("\n")}\n`);
 }
 
+export function parseOriginRepoSlug(remoteUrl) {
+  const match = remoteUrl.trim().match(/github\.com[:/]([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+?)(?:\.git)?$/);
+  if (!match) {
+    throw new Error(`无法从 origin URL 解析 GitHub 仓库名：${remoteUrl}`);
+  }
+  return match[1];
+}
+
 function getRepoSlug() {
   if (process.env.GITHUB_REPOSITORY) return process.env.GITHUB_REPOSITORY;
-  return capture("gh", ["repo", "view", "--json", "nameWithOwner", "-q", ".nameWithOwner"]);
+  return parseOriginRepoSlug(capture("git", ["remote", "get-url", "origin"]));
 }
 
 function main() {

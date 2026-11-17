@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { classifyChangedFiles, parseVerifyArgs } from "./verify-pr.mjs";
+import { classifyChangedFiles, parseOriginRepoSlug, parseVerifyArgs } from "./verify-pr.mjs";
 
 test("classifyChangedFiles distinguishes runtime/app changes from governance/docs changes", () => {
   const docsOnly = classifyChangedFiles([
@@ -35,4 +35,6 @@ test("parseVerifyArgs parses PR numbers and flags strictly", () => {
     noInstall: false,
   });
   assert.throws(() => parseVerifyArgs(["12", "--bogus"]), /未知参数/);
+  assert.equal(parseOriginRepoSlug("git@github.com:Xavier189/ClaudeMom.git"), "Xavier189/ClaudeMom");
+  assert.equal(parseOriginRepoSlug("https://github.com/Xavier189/ClaudeMom"), "Xavier189/ClaudeMom");
 });
