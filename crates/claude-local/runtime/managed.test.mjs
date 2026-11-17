@@ -603,10 +603,13 @@ test("upstream fetches share a bounded, reused connection pool through the upstr
   tlsServer.listen(0, "127.0.0.1");
   await once(tlsServer, "listening");
   const connects = [];
+  const tunnelSockets = new Set();
   const upstreamProxy = http.createServer();
   upstreamProxy.on("connect", (req, socket, head) => {
     connects.push(req.url);
+    tunnelSockets.add(socket);
     socket.on("error", () => {});
+    socket.once("close", () => tunnelSockets.delete(socket));
     const target = net.connect(tlsServer.address().port, "127.0.0.1", () => {
       socket.write("HTTP/1.1 200 Connection Established\r\n\r\n");
       if (head?.length) target.write(head);
@@ -639,6 +642,7 @@ test("upstream fetches share a bounded, reused connection pool through the upstr
     // 同一条复用的连接上跑过几十个请求，不能每次都往 socket 上叠监听器（#16 看到过这个警告）。
     assert.equal(instance.output().includes("MaxListenersExceededWarning"), false, instance.output());
   } finally {
+    for (const socket of tunnelSockets) socket.destroy();
     try {
       await stop(instance);
     } finally {
@@ -830,10 +834,15 @@ test("pass-through tunnels use the configured upstream proxy and abort when Clau
   // Claude 被 --proxy-server 指到本代理后系统代理对它失效；直通也要经后端传入的出站代理。
   const connects = [];
   const held = new Set();
+  const sockets = new Set();
   const upstreamProxy = http.createServer();
   upstreamProxy.on("connect", (req, socket) => {
     connects.push(req.url);
+    sockets.add(socket);
     socket.on("error", () => {});
+    socket.once("close", () => sockets.delete(socket));
+    // http.Server 默认 allowHalfOpen=true，CONNECT socket 收到对端 FIN 时必须主动结束写端。
+    socket.once("end", () => socket.end());
     if (req.url.startsWith("slow.test")) {
       // 模拟连不上的目标：一直不回 CONNECT。
       // connect 事件交出的 socket 默认没人读，要 resume 才收得到对端关闭；
@@ -866,6 +875,7 @@ test("pass-through tunnels use the configured upstream proxy and abort when Clau
     pending.destroy();
     await waitFor(() => held.size === 0, "Claude 放弃后发往出站代理的连接没有取消");
   } finally {
+    for (const socket of sockets) socket.destroy();
     try {
       await stop(instance);
     } finally {
