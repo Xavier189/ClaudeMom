@@ -4,6 +4,7 @@ import { scanLineForLeaks, validateGitIdentity } from "./check-invariants.mjs";
 
 test("validateGitIdentity allows maintainer noreply and official GitHub bots only", () => {
   assert.equal(validateGitIdentity("Xavier189 <63280269+Xavier189@users.noreply.github.com>").ok, true);
+  assert.equal(validateGitIdentity("Xavier <63280269+Xavier189@users.noreply.github.com>").ok, true);
   assert.equal(validateGitIdentity("Xavier189 <Xavier189@users.noreply.github.com>").ok, true);
   assert.equal(validateGitIdentity("github-actions[bot] <41898282+github-actions[bot]@users.noreply.github.com>").ok, true);
   assert.equal(validateGitIdentity("copilot-swe-agent[bot] <198982749+copilot-swe-agent[bot]@users.noreply.github.com>").ok, true);

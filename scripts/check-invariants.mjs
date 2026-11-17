@@ -13,7 +13,8 @@ import { fileURLToPath } from "node:url";
 
 export const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
-const ALLOWED_HUMAN_LOGINS = new Set(["Xavier189"]);
+const ALLOWED_HUMAN_LOGINS = new Set(["xavier189"]);
+const ALLOWED_HUMAN_NAMES = new Set(["Xavier189", "Xavier"]);
 const NOREPLY_IDENTITY_RE = /^([A-Za-z0-9-]+(?:\[bot\])?) <(?:\d+\+)?([A-Za-z0-9-]+(?:\[bot\])?)@users\.noreply\.github\.com>$/;
 const GITHUB_WEB_FLOW_RE = /^GitHub <noreply@github\.com>$/;
 
@@ -38,10 +39,10 @@ export function validateGitIdentity(ident) {
   const [, name, emailLogin] = match;
   const isBot = name.endsWith("[bot]") && emailLogin.toLowerCase() === name.toLowerCase();
   if (isBot) return { ok: true };
-  if (!ALLOWED_HUMAN_LOGINS.has(name) || emailLogin.toLowerCase() !== name.toLowerCase()) {
+  if (!ALLOWED_HUMAN_NAMES.has(name) || !ALLOWED_HUMAN_LOGINS.has(emailLogin.toLowerCase())) {
     return {
       ok: false,
-      reason: `非白名单 GitHub 提交身份 "${trimmed}"（仅允许 Xavier189 或官方 *[bot] noreply 身份）`,
+      reason: `非白名单 GitHub 提交身份 "${trimmed}"（仅允许 Xavier189/Xavier noreply 或官方 *[bot] 身份）`,
     };
   }
   return { ok: true };
