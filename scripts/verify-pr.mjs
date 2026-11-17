@@ -29,8 +29,6 @@ const RUNTIME_PATH_PREFIXES = [
   "crates/",
   "Cargo.toml",
   "Cargo.lock",
-  "scripts/build-local.mjs",
-  "scripts/relaunch-local.mjs",
 ];
 
 export function classifyChangedFiles(files) {

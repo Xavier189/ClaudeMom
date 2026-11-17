@@ -13,13 +13,14 @@
 | `local/verified-*` | **本机实测回滚锚点标签** | 仅在通过 `node scripts/verify-pr.mjs <PR>` 或本机实测签收后创建并显式推送。 |
 | `v*` | **原作者公开发版标签** | **严禁**在个人 Fork 新建或推送（GitHub Ruleset 已在服务端封禁）。 |
 
-## 2. Git 提交身份与隐私红线
+## 2. 平台范围与 Git 隐私红线
 
-1. **严禁暴露本机系统用户名、真实姓名、个人邮箱、公司邮箱或本机家目录路径（如 `/Users/<真实用户名>`）**。
-2. 仓库内所有非上游提交的 `Author` 与 `Committer` 必须严格使用 GitHub 脱敏身份：
+1. **专注 macOS 平台（暂不考虑 Windows）**：本 Fork 的 CI、打包与实测验收均只面向 macOS。开发个人定制功能时无需编写或测试 Windows 适配；对于上游源码中已有的 `#[cfg(windows)]` / `win32` 分支，为避免每次同步上游产生大面积合并冲突，保持原样不主动删除即可。
+2. **严禁暴露本机系统用户名、真实姓名、个人邮箱、公司邮箱或本机家目录路径（如 `/Users/<真实用户名>`）**。
+3. 仓库内所有非上游提交的 `Author` 与 `Committer` 必须严格使用 GitHub 脱敏身份：
    - 维护者身份：`Xavier189 <63280269+Xavier189@users.noreply.github.com>`
    - 官方自动化/云端 Agent 身份：`* <*@users.noreply.github.com>` 或 `GitHub <noreply@github.com>`
-3. 严禁将任何上游网关 Base URL、API Key、证书私钥或 `~/.claude-mom` 运行配置写入仓库、测试或 PR 描述。
+4. 严禁将任何上游网关 Base URL、API Key、证书私钥或 `~/.claude-mom` 运行配置写入仓库、测试或 PR 描述。
 
 ## 3. 核心个人定制清单（合并上游时不得静默丢失）
 

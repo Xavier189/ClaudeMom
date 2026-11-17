@@ -263,7 +263,7 @@ function main() {
           "-f",
           "context=ci-gate",
           "-f",
-          "description=Running cross-platform CI and personal invariants check...",
+          "description=Running macOS CI and personal invariants check...",
         ];
         if (runUrl) statusArgs.push("-f", `target_url=${runUrl}`);
         capture("gh", statusArgs);

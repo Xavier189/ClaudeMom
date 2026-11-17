@@ -1,6 +1,6 @@
 # 自动跟踪原作者仓库 BigPizzaV3/ClaudeMom 更新：
 #   1. 调用 scripts/sync-upstream.mjs 快进更新 upstream-main，并在有未合入更新时创建/更新 sync/upstream-main -> main PR
-#   2. 无冲突时自动串联 CI（双平台编译测试 + 个人定制不变量守卫），随后等待维护者本机实测签收（local-verified）
+#   2. 无冲突时自动串联 CI（macOS 编译测试 + 个人定制不变量守卫），随后等待维护者本机实测签收（local-verified）
 #   3. 发生 Git 冲突或 CI 红灯时自动转为草稿 PR 并附带可直接交给任意 Coding Agent 执行的修复指令
 name: Upstream Sync
 

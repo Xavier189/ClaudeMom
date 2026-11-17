@@ -1,6 +1,6 @@
-# 持续集成门禁：
-#   1. invariants：提交身份脱敏校验、禁区泄露扫描、6 项个人定制契约不变量检查与治理脚本单测
-#   2. test：macOS / Windows 双平台前端、Rust 与本地兼容服务测试及 release 编译
+# 持续集成门禁（专注 macOS 平台）：
+#   1. invariants：提交身份脱敏校验、禁区泄露扫描、个人定制契约不变量检查与治理脚本单测
+#   2. test：macOS 前端、Rust workspace、本地兼容服务（Node）测试与 release 编译校验
 #   3. ci-gate：汇总上述全部结果并向目标 Commit SHA 上报 ci-gate 状态位（供分支保护 Ruleset 强校验）
 name: CI
 
@@ -51,11 +51,8 @@ jobs:
           node --test scripts/*.test.mjs
 
   test:
-    strategy:
-      fail-fast: false
-      matrix:
-        platform: [macos-latest, windows-latest]
-    runs-on: ${{ matrix.platform }}
+    name: macOS Test & Build Check
+    runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
         with:
@@ -83,13 +80,12 @@ jobs:
         run: cargo test --workspace --locked
 
       - name: 本地兼容服务（Node）测试
-        if: matrix.platform == 'macos-latest'
         working-directory: crates/claude-local/runtime
         run: |
           bash scripts/gen-ca.sh
           node --test --test-timeout=120000 managed.test.mjs proxy.test.mjs scripts/*.test.mjs
 
-      - name: release 编译
+      - name: release 编译校验
         run: cargo build --release -p claude-mom --locked
 
   ci-gate:
@@ -114,7 +110,7 @@ jobs:
           set -euo pipefail
           if [ "$INVARIANTS_RESULT" = "success" ] && [ "$TEST_RESULT" = "success" ]; then
             state="success"
-            desc="All invariants and cross-platform CI checks passed"
+            desc="All invariants and macOS CI checks passed"
           else
             state="failure"
             desc="CI failed (invariants=$INVARIANTS_RESULT, test=$TEST_RESULT)"

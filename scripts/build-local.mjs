@@ -64,6 +64,7 @@ if (!dryRun) fs.rmSync(manifestPath, { force: true });
 run("npm", ["ci", "--no-audit", "--no-fund"], appDir);
 run("npm", ["run", "check"], appDir);
 run("npm", ["test"], appDir);
+run("npm", ["run", "vite:build"], appDir);
 run("cargo", ["test", "--workspace", "--locked"]);
 const caDir = dryRun ? "<temporary-test-ca>" : fs.mkdtempSync(path.join(os.tmpdir(), "claudemom-build-ca-"));
 try {

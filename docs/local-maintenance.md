@@ -51,7 +51,7 @@ git config core.hooksPath .githooks
 
 1. 自动将 `origin/upstream-main` 快进更新至 `BigPizzaV3/ClaudeMom:main`。
 2. 若 `main` 尚未包含最新上游提交，在 `sync/upstream-main` 尝试合并 `origin/main` 与最新上游：
-   - **无冲突**：自动发起/更新指向 `main` 的同步 PR，立即调用 [ci.yml](../.github/workflows/ci.yml) 执行双平台编译测试与个人定制不变量检查，汇总写入 `ci-gate` 状态。
+   - **无冲突**：自动发起/更新指向 `main` 的同步 PR，立即调用 [ci.yml](../.github/workflows/ci.yml) 执行 macOS 编译测试与个人定制不变量检查，汇总写入 `ci-gate` 状态。
    - **发生 Git 冲突或 CI 失败**：自动将同步 PR 转为草稿（标题带 `[CONFLICT]` 或 `[CI FAILED]`），并在 PR 中附上冲突清单与可直接复制给任一 Coding Agent 的修复提示词。
 
 ### 2. 多 Agent 日常开发与冲突修复
