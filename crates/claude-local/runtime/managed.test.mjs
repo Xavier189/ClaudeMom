@@ -155,8 +155,28 @@ async function stop(instance, signal = false) {
   if (!instance || instance.child.exitCode !== null) return;
   if (signal) instance.child.kill("SIGTERM");
   else instance.child.stdin.end();
-  const result = await Promise.race([instance.closed, delay(5000).then(() => { throw new Error("Managed fixture did not exit"); })]);
-  assert.equal(result[0], 0);
+  let timer;
+  const timedOut = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`Managed fixture did not exit\n${instance.output()}`)), 5000);
+  });
+  try {
+    const result = await Promise.race([instance.closed, timedOut]);
+    assert.equal(result[0], 0);
+  } catch (error) {
+    if (instance.child.exitCode === null) {
+      instance.child.kill("SIGKILL");
+      await Promise.race([instance.closed, delay(1000)]);
+    }
+    throw error;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function closeServer(server) {
+  if (!server) return;
+  server.closeAllConnections?.();
+  if (server.listening) await new Promise((resolve) => server.close(resolve));
 }
 
 const header = (conv) => ld(1, Buffer.concat([ld(1, Buffer.concat([ld(1, "test-session"), vi(2, 1)])), ld(2, conv)]));
@@ -235,9 +255,12 @@ before(async () => {
 });
 
 after(async () => {
-  await stop(service);
-  gateway?.closeAllConnections();
-  await new Promise((resolve) => gateway?.close(resolve));
+  try {
+    await stop(service);
+  } finally {
+    http.globalAgent.destroy();
+    await closeServer(gateway);
+  }
 });
 
 test("managed readiness reports an assigned port and health polling is not client traffic", async () => {
@@ -409,8 +432,11 @@ test("outbound CONNECT TLS failures leave the managed proxy healthy", async () =
     }
   } finally {
     for (const socket of sockets) socket.destroy();
-    await stop(instance);
-    await new Promise((resolve) => upstreamProxy.close(resolve));
+    try {
+      await stop(instance);
+    } finally {
+      await closeServer(upstreamProxy);
+    }
   }
 });
 
@@ -444,8 +470,11 @@ test("cancelling an upstream request closes pending CONNECT and TLS sockets", as
     }
   } finally {
     socket?.destroy();
-    await stop(instance);
-    await new Promise((resolve) => upstreamProxy.close(resolve));
+    try {
+      await stop(instance);
+    } finally {
+      await closeServer(upstreamProxy);
+    }
   }
 });
 
@@ -472,8 +501,11 @@ test("an upstream CONNECT timeout closes its socket and leaves health available"
     assert.equal((await request(instance, "/__codex_claude_local/health")).status, 200);
   } finally {
     socket?.destroy();
-    await stop(instance);
-    await new Promise((resolve) => upstreamProxy.close(resolve));
+    try {
+      await stop(instance);
+    } finally {
+      await closeServer(upstreamProxy);
+    }
   }
 });
 
@@ -550,8 +582,11 @@ test("installed template with its own shell never serves an online or cached she
     assert.ok(bootstrap.json);
     assert.deepEqual(connects, [], "模板自带外壳时不去线上抓");
   } finally {
-    await stop(instance);
-    upstreamProxy.close();
+    try {
+      await stop(instance);
+    } finally {
+      await closeServer(upstreamProxy);
+    }
   }
 });
 
@@ -604,11 +639,11 @@ test("upstream fetches share a bounded, reused connection pool through the upstr
     // 同一条复用的连接上跑过几十个请求，不能每次都往 socket 上叠监听器（#16 看到过这个警告）。
     assert.equal(instance.output().includes("MaxListenersExceededWarning"), false, instance.output());
   } finally {
-    await stop(instance);
-    upstreamProxy.closeAllConnections();
-    upstreamProxy.close();
-    tlsServer.closeAllConnections();
-    tlsServer.close();
+    try {
+      await stop(instance);
+    } finally {
+      await Promise.all([closeServer(upstreamProxy), closeServer(tlsServer)]);
+    }
   }
 });
 
@@ -831,9 +866,11 @@ test("pass-through tunnels use the configured upstream proxy and abort when Clau
     pending.destroy();
     await waitFor(() => held.size === 0, "Claude 放弃后发往出站代理的连接没有取消");
   } finally {
-    await stop(instance);
-    upstreamProxy.closeAllConnections();
-    upstreamProxy.close();
+    try {
+      await stop(instance);
+    } finally {
+      await closeServer(upstreamProxy);
+    }
   }
 });
 

@@ -2784,6 +2784,8 @@ function shutdown() {
   stopping = true;
   clearTimeout(readyWriteTimer);
   stateStore.flush();
+  directAgent.destroy();
+  tunnelAgent?.destroy();
   outer.close(() => process.exit(0));
   for (const socket of clientSockets) socket.destroy();
   setTimeout(() => process.exit(0), 1000).unref();
