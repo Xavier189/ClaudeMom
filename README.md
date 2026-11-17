@@ -78,20 +78,22 @@ node scripts/relaunch-local.mjs    # 构建并重启本地实例（在仓库根�
 
 ## 个人 Fork 自动化维护规则
 
-本仓库采用「双主干隔离 + PR 双门禁 + 多 Agent 统一契约」维护个人定制版本，默认工作主线为 `main`：
+本仓库采用「双主干隔离 + 最简 PR 门禁 + 多 Agent 统一契约」维护 macOS 个人定制版本，默认工作主线为 `main`（已停用 GitHub Actions，统一通过 `grokbot` / 本地脚本拉取 PR 验证后合入）：
 
 | 项目 | 约定 | 说明 |
 | --- | --- | --- |
 | `origin` | `Xavier189/ClaudeMom` | 个人 Fork，托管个人黄金主线 `main`、上游镜像 `upstream-main` 与 `local/verified-*` 标签 |
 | `upstream` | `BigPizzaV3/ClaudeMom` | 作者上游仓库，只拉取更新并禁用推送（`pushurl = no_push`） |
-| `main` | **个人长期黄金主线** | 默认分支，禁止直推；所有变更须经 PR 通过云端 `ci-gate` 与本机实测 `local-verified` 后以 Merge Commit 合入 |
+| `main` | **个人长期黄金主线** | 默认分支，禁止直推；所有变更须经 PR 验证通过后以 Merge Commit 合入 |
 | `upstream-main` | **上游干净镜像** | 仅通过 `--ff-only` 同步 `BigPizzaV3/ClaudeMom:main`，不提交任何定制改动 |
 
 日常协作与自动化流程：
 
-1. **自动追平上游**：[upstream-sync.yml](.github/workflows/upstream-sync.yml) 每日自动快进 `upstream-main`，并在有上游更新时向 `main` 发起 `sync/upstream-main` 预合并 PR；发生冲突或 CI 失败时自动转为草稿 PR 并生成 Agent 修复指令。
+1. **主动追平上游**：运行 `node scripts/sync-upstream.mjs`（可由 `grokbot` 或本机定时执行）自动快进 `upstream-main`，并在有上游更新时向 `main` 发起 `sync/upstream-main` 预合并 PR；遇冲突自动转为 `[CONFLICT]` 草稿 PR 并附修复指令。
 2. **多 Agent 协同开发**：所有 Coding Agent 统一遵循 [AGENTS.md](AGENTS.md)（`CLAUDE.md` 同源软链），从 `main` 切分支提 PR，由 [check-invariants.mjs](scripts/check-invariants.mjs) 自动守护提交脱敏身份与个人定制不变量。
-3. **本机实测签收合入**：云端 `ci-gate` 通过后，在本机运行 `node scripts/verify-pr.mjs <PR编号>` 自动在隔离 worktree 预合并打包、拉起 Claude Desktop 完成真机实测，输入 `pass` 后自动备份替换应用、上报 `local-verified` 状态、合入 `main` 并推送 `local/verified-*` 标签。
+3. **PR 拉取验证与合入**：
+   - **自动化验证合并（grokbot / Agent）**：运行 `node scripts/verify-pr.mjs <PR编号> --auto` 在隔离 `git worktree` 预合并跑完全套不变量与测试，通过自动 Merge，失败自动转草稿并留言报错；
+   - **本机真机实测安装**：运行 `node scripts/verify-pr.mjs <PR编号>` 打包 `.app` 并拉起 Claude Desktop 完成真机交互实测，输入 `pass` 后自动备份替换应用、Merge PR 并推送 `local/verified-*` 标签。
 4. **禁止操作**：不点击应用内更新（仍指向上游 Release），不运行 [release.mjs](scripts/release.mjs)，不向个人 Fork 推送 `v*` 标签。
 
 完整命令、远端初始化、冲突修复与回滚步骤见 [个人 Fork 维护与本地打包指南](docs/local-maintenance.md) 与 [AGENTS.md](AGENTS.md)。

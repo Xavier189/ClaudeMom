@@ -127,8 +127,6 @@ const GOVERNANCE_FILES = [
   "AGENTS.md",
   "CLAUDE.md",
   ".githooks/pre-commit",
-  ".github/workflows/ci.yml",
-  ".github/workflows/upstream-sync.yml",
   "scripts/sync-upstream.mjs",
   "scripts/verify-pr.mjs",
 ];
