@@ -51,7 +51,11 @@ if (!VERSION_PATTERN.test(version)) {
   fail("用法：node scripts/release.mjs <版本号，如 0.1.4> [--dry-run]");
 }
 
-// 1. 工作区：必须在 main 上，除 CHANGELOG.md 外不能有未提交的改动（未跟踪文件不管）。
+// 1. 工作区：必须在原作者仓库的 main 上，除 CHANGELOG.md 外不能有未提交的改动（未跟踪文件不管）。
+const originUrl = tryRun("git", ["remote", "get-url", "origin"]).out;
+if (process.env.ALLOW_FORK_RELEASE !== "1" && !/BigPizzaV3\/ClaudeMom(?:\.git)?$/i.test(originUrl)) {
+  fail(`当前 origin (${originUrl || "未知"}) 不是原作者仓库 BigPizzaV3/ClaudeMom，禁止发版推送 v* 标签；个人 Fork 请使用 node scripts/verify-pr.mjs <PR> 或 node scripts/build-local.mjs`);
+}
 const branch = run("git", ["rev-parse", "--abbrev-ref", "HEAD"]);
 if (branch !== "main") fail(`当前在 ${branch} 分支，发版只从 main 发`);
 // -z 输出不能 trim：行首的状态列是空格，trim 掉会把文件名切掉一个字符。

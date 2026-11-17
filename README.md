@@ -76,25 +76,25 @@ node scripts/relaunch-local.mjs    # 构建并重启本地实例（在仓库根�
 核心的 Node 测试：`cd crates/claude-local/runtime && node --test managed.test.mjs proxy.test.mjs`
 （需要本地测试证书：`scripts/gen-ca.sh`）。
 
-## 个人 Fork 维护规则
+## 个人 Fork 自动化维护规则
 
-本仓库采用双远端与双主分支模式维护个人定制版本，统一工作分支为 `personal`：
+本仓库采用「双主干隔离 + PR 双门禁 + 多 Agent 统一契约」维护个人定制版本，默认工作主线为 `main`：
 
 | 项目 | 约定 | 说明 |
 | --- | --- | --- |
-| `origin` | `Xavier189/ClaudeMom` | 个人 Fork，推送 `main`、`personal` 与 `local/verified-*` 标签 |
+| `origin` | `Xavier189/ClaudeMom` | 个人 Fork，托管个人黄金主线 `main`、上游镜像 `upstream-main` 与 `local/verified-*` 标签 |
 | `upstream` | `BigPizzaV3/ClaudeMom` | 作者上游仓库，只拉取更新并禁用推送（`pushurl = no_push`） |
-| `main` | 上游干净镜像 | 仅通过 `git merge --ff-only upstream/main` 同步，不在该分支提交定制改动 |
-| `personal` | 长期个人主线 | 存放全部个人改造，使用 `git merge --no-edit upstream/main` 接入上游更新（不改写已打标签历史） |
+| `main` | **个人长期黄金主线** | 默认分支，禁止直推；所有变更须经 PR 通过云端 `ci-gate` 与本机实测 `local-verified` 后以 Merge Commit 合入 |
+| `upstream-main` | **上游干净镜像** | 仅通过 `--ff-only` 同步 `BigPizzaV3/ClaudeMom:main`，不提交任何定制改动 |
 
-日常操作规则：
+日常协作与自动化流程：
 
-1. **同步上游**：在 `main` 快进合并 `upstream/main` 并推送到 `origin/main`；切回 `personal` 合并 `upstream/main`，排查冲突与同类修复后再打包。
-2. **验证与打包**：在 `personal` 运行 `node scripts/build-local.mjs`，安装验收后打 `local/verified-YYYYMMDD-HHMMSS` 标签并显式推送到 `origin`。
-3. **跨平台 CI（可选）**：[ci.yml](.github/workflows/ci.yml) 只监听 `main` 与 `pull_request`；在 `Xavier189/ClaudeMom` 保留一个 `personal -> main` 的长期草稿 PR 即可直观查看总 Diff 并触发双平台检查。
-4. **禁止操作**：不点击应用内更新（仍指向上游 Release），不运行 [release.mjs](scripts/release.mjs)，不向个人 Fork 推送 `v*` 标签（[release.yml](.github/workflows/release.yml) 缺少 Apple 公证与签名密钥会失败）。
+1. **自动追平上游**：[upstream-sync.yml](.github/workflows/upstream-sync.yml) 每日自动快进 `upstream-main`，并在有上游更新时向 `main` 发起 `sync/upstream-main` 预合并 PR；发生冲突或 CI 失败时自动转为草稿 PR 并生成 Agent 修复指令。
+2. **多 Agent 协同开发**：所有 Coding Agent 统一遵循 [AGENTS.md](AGENTS.md)（`CLAUDE.md` 同源软链），从 `main` 切分支提 PR，由 [check-invariants.mjs](scripts/check-invariants.mjs) 自动守护提交脱敏身份与个人定制不变量。
+3. **本机实测签收合入**：云端 `ci-gate` 通过后，在本机运行 `node scripts/verify-pr.mjs <PR编号>` 自动在隔离 worktree 预合并打包、拉起 Claude Desktop 完成真机实测，输入 `pass` 后自动备份替换应用、上报 `local-verified` 状态、合入 `main` 并推送 `local/verified-*` 标签。
+4. **禁止操作**：不点击应用内更新（仍指向上游 Release），不运行 [release.mjs](scripts/release.mjs)，不向个人 Fork 推送 `v*` 标签。
 
-完整命令、远端初始化、向作者提纯净 PR 与回滚步骤见 [个人 Fork 维护与本地打包指南](docs/local-maintenance.md)。
+完整命令、远端初始化、冲突修复与回滚步骤见 [个人 Fork 维护与本地打包指南](docs/local-maintenance.md) 与 [AGENTS.md](AGENTS.md)。
 
 ## 许可
 

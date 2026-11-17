@@ -1,21 +1,62 @@
-# 每次推送 main：macOS / Windows 上跑测试并完整编一遍（不打包、不发布），发版前先把平台问题暴露出来。
+# 持续集成门禁（专注 macOS 平台）：
+#   1. invariants：提交身份脱敏校验、禁区泄露扫描、个人定制契约不变量检查与治理脚本单测
+#   2. test：macOS 前端、Rust workspace、本地兼容服务（Node）测试与 release 编译校验
+#   3. ci-gate：汇总上述全部结果并向目标 Commit SHA 上报 ci-gate 状态位（供分支保护 Ruleset 强校验）
 name: CI
 
 on:
   push:
     branches: [main]
   pull_request:
+    branches: [main]
+  workflow_call:
+    inputs:
+      checkout_ref:
+        description: "指定检出的分支或提交（供 upstream-sync 复用调用）"
+        required: false
+        type: string
+        default: ""
+      status_sha:
+        description: "指定上报 ci-gate 状态的 Commit SHA"
+        required: false
+        type: string
+        default: ""
   workflow_dispatch:
 
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ inputs.status_sha || github.event.pull_request.head.sha || github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
 jobs:
-  test:
-    strategy:
-      fail-fast: false
-      matrix:
-        platform: [macos-latest, windows-latest]
-    runs-on: ${{ matrix.platform }}
+  invariants:
+    name: Invariants & Privacy Gate
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.checkout_ref || '' }}
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: 拉取基准分支引用并执行不变量与脚本单测
+        run: |
+          git fetch origin upstream-main main --quiet || true
+          node scripts/check-invariants.mjs
+          node --test scripts/*.test.mjs
+
+  test:
+    name: macOS Test & Build Check
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.checkout_ref || '' }}
 
       - uses: actions/setup-node@v4
         with:
@@ -36,14 +77,54 @@ jobs:
           npm run vite:build
 
       - name: Rust 测试
-        run: cargo test --workspace
+        run: cargo test --workspace --locked
 
       - name: 本地兼容服务（Node）测试
-        if: matrix.platform == 'macos-latest'
         working-directory: crates/claude-local/runtime
         run: |
           bash scripts/gen-ca.sh
           node --test --test-timeout=120000 managed.test.mjs proxy.test.mjs scripts/*.test.mjs
 
-      - name: release 编译
-        run: cargo build --release -p claude-mom
+      - name: release 编译校验
+        run: cargo build --release -p claude-mom --locked
+
+  ci-gate:
+    name: Report CI Gate Status
+    if: always()
+    needs: [invariants, test]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      statuses: write
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      TARGET_SHA: ${{ inputs.status_sha || github.event.pull_request.head.sha || github.sha }}
+      INVARIANTS_RESULT: ${{ needs.invariants.result }}
+      TEST_RESULT: ${{ needs.test.result }}
+      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      CAN_WRITE_STATUS: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
+    steps:
+      - name: 上报汇总门禁状态 ci-gate
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "$INVARIANTS_RESULT" = "success" ] && [ "$TEST_RESULT" = "success" ]; then
+            state="success"
+            desc="All invariants and macOS CI checks passed"
+          else
+            state="failure"
+            desc="CI failed (invariants=$INVARIANTS_RESULT, test=$TEST_RESULT)"
+          fi
+
+          if [ "$CAN_WRITE_STATUS" = "true" ] && [ -n "$TARGET_SHA" ]; then
+            gh api -X POST "repos/${GITHUB_REPOSITORY}/statuses/${TARGET_SHA}" \
+              -f state="$state" \
+              -f context="ci-gate" \
+              -f description="$desc" \
+              -f target_url="$RUN_URL" >/dev/null
+            echo "Reported ci-gate=$state on $TARGET_SHA"
+          fi
+
+          if [ "$state" != "success" ]; then
+            exit 1
+          fi

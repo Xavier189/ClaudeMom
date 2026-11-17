@@ -1,0 +1,13 @@
+#!/usr/bin/env sh
+set -eu
+
+branch=$(git symbolic-ref --quiet --short HEAD 2>/dev/null || echo "DETACHED")
+
+if [ "${ALLOW_MAIN_COMMIT:-0}" != "1" ] && { [ "$branch" = "main" ] || [ "$branch" = "upstream-main" ]; }; then
+  echo "✗ [pre-commit] 禁止直接在受保护分支 '$branch' 上提交。" >&2
+  echo "  远端已开启 PR 门禁，请先切出工作分支再提交：" >&2
+  echo "    git switch -c feat/<topic>   # 或 fix/<topic>" >&2
+  exit 1
+fi
+
+node scripts/check-invariants.mjs --staged

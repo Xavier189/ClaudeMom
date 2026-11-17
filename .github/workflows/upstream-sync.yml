@@ -1,0 +1,102 @@
+# 自动跟踪原作者仓库 BigPizzaV3/ClaudeMom 更新：
+#   1. 调用 scripts/sync-upstream.mjs 快进更新 upstream-main，并在有未合入更新时创建/更新 sync/upstream-main -> main PR
+#   2. 无冲突时自动串联 CI（macOS 编译测试 + 个人定制不变量守卫），随后等待维护者本机实测签收（local-verified）
+#   3. 发生 Git 冲突或 CI 红灯时自动转为草稿 PR 并附带可直接交给任意 Coding Agent 执行的修复指令
+name: Upstream Sync
+
+on:
+  schedule:
+    # 每天 UTC 01:17（北京时间 09:17）自动检查上游更新
+    - cron: "17 1 * * *"
+  workflow_dispatch:
+    inputs:
+      force_resync:
+        description: "强制基于最新 main 重建已有同步分支（覆盖未合入的 sync/upstream-main）"
+        required: false
+        type: boolean
+        default: false
+
+concurrency:
+  group: upstream-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    name: Sync upstream-main & Prepare PR
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+      statuses: write
+    outputs:
+      needs_ci: ${{ steps.sync_pr.outputs.needs_ci }}
+      pr_head_sha: ${{ steps.sync_pr.outputs.pr_head_sha }}
+      pr_number: ${{ steps.sync_pr.outputs.pr_number }}
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: 执行上游同步与预合并检查
+        id: sync_pr
+        shell: bash
+        run: |
+          args=()
+          if [ "${{ inputs.force_resync }}" = "true" ]; then
+            args+=("--force-resync")
+          fi
+          node scripts/sync-upstream.mjs "${args[@]}"
+
+  verify-sync-pr:
+    name: Run CI on Sync PR
+    needs: sync
+    if: needs.sync.outputs.needs_ci == 'true'
+    permissions:
+      contents: read
+      statuses: write
+    uses: ./.github/workflows/ci.yml
+    with:
+      checkout_ref: sync/upstream-main
+      status_sha: ${{ needs.sync.outputs.pr_head_sha }}
+
+  flag-ci-failure:
+    name: Convert Sync PR to Draft on CI Failure
+    needs: [sync, verify-sync-pr]
+    if: always() && needs.sync.outputs.needs_ci == 'true' && needs.verify-sync-pr.result != 'success'
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      PR_NUM: ${{ needs.sync.outputs.pr_number }}
+      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+    steps:
+      - name: 标记同步 PR 为草稿并输出 Agent 修复提示
+        shell: bash
+        run: |
+          set -euo pipefail
+          current_title=$(gh pr view "$PR_NUM" --repo "$GITHUB_REPOSITORY" --json title -q .title)
+          case "$current_title" in
+            *"[CI FAILED]"*) new_title="$current_title" ;;
+            *) new_title="${current_title/chore(sync): /chore(sync): [CI FAILED] }" ;;
+          esac
+          gh pr edit "$PR_NUM" --repo "$GITHUB_REPOSITORY" --title "$new_title"
+          gh pr ready --undo "$PR_NUM" --repo "$GITHUB_REPOSITORY" 2>/dev/null || true
+          gh pr comment "$PR_NUM" --repo "$GITHUB_REPOSITORY" --body "$(cat <<EOF
+          ### ❌ 自动合并虽无 Git 冲突，但未通过 CI 或个人定制不变量检查
+
+          - **失败流水线日志**：${RUN_URL}
+
+          #### 🤖 可直接复制给 Coding Agent 的修复指令
+          \`\`\`text
+          请阅读根目录 AGENTS.md，检出 sync/upstream-main 分支排查并修复上游合并后的测试或不变量失败（流水线：${RUN_URL}）。
+          修复后确保 node scripts/check-invariants.mjs 与 node scripts/build-local.mjs --check-only 全部通过，推送到 origin sync/upstream-main。
+          \`\`\`
+          EOF
+          )"
