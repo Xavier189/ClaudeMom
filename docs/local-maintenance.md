@@ -1,95 +1,96 @@
 # ClaudeMom 个人 Fork 维护与本地打包指南
 
-本手册规定个人 Fork（`Xavier189/ClaudeMom`）与作者上游仓库（`BigPizzaV3/ClaudeMom`）之间的分支协作、上游合并、本地构建安装及回滚规则。
-在 macOS 上构建并安装 `personal` 分支需要 Node.js 22+、npm、Rust 工具链和 Xcode Command Line Tools。
+本手册规定个人 Fork（`Xavier189/ClaudeMom`）与作者上游仓库（`BigPizzaV3/ClaudeMom`）之间的分支门禁、自动上游同步、多 Agent 开发、本机真机实测签收及回滚规则。
+在 macOS 上构建并安装 `main` 分支需要 Node.js 22+、npm、Rust 工具链和 Xcode Command Line Tools。
 
-该流程只向个人 Fork 推送源码与 `local/verified-*` 本地验证标签，不修改作者上游仓库，也不产出带 Apple 公证签名或自动更新元数据的公开发行包。
+该流程只向个人 Fork 推送经脱敏身份提交的源码与 `local/verified-*` 本地验证标签，不修改作者上游仓库，也不产出带 Apple 公证签名或自动更新元数据的公开发行包。
 
-## 远端、分支与标签约定
+## 远端、分支与门禁约定
 
 | 远端名 | 仓库地址 | 用途与推送限制 |
 | --- | --- | --- |
-| `origin` | `git@github.com:Xavier189/ClaudeMom.git` | 个人 Fork，托管镜像 `main`、`personal` 定制分支与 `local/verified-*` 标签 |
+| `origin` | `git@github.com:Xavier189/ClaudeMom.git` | 个人 Fork，托管默认黄金主线 `main`、上游干净镜像 `upstream-main` 与 `local/verified-*` 标签 |
 | `upstream` | `https://github.com/BigPizzaV3/ClaudeMom.git` | 作者上游仓库，只拉取更新；本地将 `pushurl` 设为 `no_push` 以防误推 |
 
 | 引用名 | 类型 | 规则与用途 |
 | --- | --- | --- |
-| `main` | 分支 | 上游干净镜像，只通过 `git merge --ff-only upstream/main` 更新，不在该分支提交个人改动 |
-| `personal` | 分支 | 长期个人维护主线，保存全部个人定制并通过合并 `upstream/main` 接入上游更新 |
-| `local/verified-YYYYMMDD-HHMMSS` | 标签 | 本地构建并完成实机交互验收后的回退锚点，可显式推送到 `origin` |
-| `v*`（例如 `v0.1.3`） | 标签 | 上游发版标签；不要在个人 Fork 新建或推送 `v*` 标签，以免触发 [release.yml](../.github/workflows/release.yml) |
+| `main` | 默认主分支 | **个人长期黄金主线**；服务端开启 Ruleset 禁止直推与强推，必须经 PR 通过 `ci-gate` 与 `local-verified` 双状态检查后以 Merge Commit 合入 |
+| `upstream-main` | 镜像分支 | **作者上游干净镜像**；服务端禁止强推与删除，仅通过 `--ff-only` 同步 `upstream/main`，不在该分支提交任何个人改动 |
+| `sync/upstream-main` | 同步分支 | 由 [upstream-sync.yml](../.github/workflows/upstream-sync.yml) 自动维护的上游同步 PR 分支 |
+| `local/verified-YYYYMMDD-HHMMSS` | 标签 | 本机完成真机交互验收并合入 `main` 后的回退锚点标签 |
+| `v*`（例如 `v0.1.7`） | 标签 | 上游发版标签；服务端 Ruleset 已封禁在个人 Fork 创建或更新 `v*` 标签，防止误触发 [release.yml](../.github/workflows/release.yml) |
 
-## 检查或初始化仓库远端
+## 检查或初始化仓库远端与本地钩子
 
-在另一台机器克隆仓库或排查远端配置是否偏移时，先运行以下检查：
+在另一台机器克隆仓库或排查配置是否偏移时，先运行以下初始化：
 
 ```bash
 git remote -v
 git branch -vv
+git config core.hooksPath .githooks
 ```
 
-根据输出按对应条件补齐配置：
+根据输出按对应条件补齐远端：
 
-- **从个人 Fork 克隆仓库且缺少 `upstream` 时**：添加只读上游远端并拉取上游分支与标签。
+- **从个人 Fork 克隆仓库且缺少 `upstream` 时**：添加只读上游远端并拉取上游分支。
 
   ```bash
   git remote add upstream https://github.com/BigPizzaV3/ClaudeMom.git
   git remote set-url --push upstream no_push
   git fetch upstream --tags
-  ```
-
-- **仓库的 `origin` 仍指向 `BigPizzaV3/ClaudeMom` 时**：把该 `origin` 改名为 `upstream`，再把 `origin` 指向个人 Fork。
-
-  ```bash
-  git remote rename origin upstream
-  git remote set-url --push upstream no_push
-  git remote add origin git@github.com:Xavier189/ClaudeMom.git
   git fetch origin --prune
-  git branch -u origin/main main
   ```
 
-## 同步上游并合并到 personal
+- **核对提交脱敏身份**：确认 `git config user.name` 为 `Xavier189` 且 `user.email` 为 `63280269+Xavier189@users.noreply.github.com`（本地 `.githooks/pre-commit` 与云端 [check-invariants.mjs](../scripts/check-invariants.mjs) 均会强制拦截私人用户名或公司邮箱）。
 
-1. 确认工作区干净后，先快进同步 `main` 并推送到 `origin/main`（不要在 `main` 提交定制改动）。
+## 自动上游同步与 PR 签收工作流
 
-   ```bash
-   git status --short
-   git switch main
-   git fetch upstream --tags
-   git merge --ff-only upstream/main
-   git push origin main
-   ```
+### 1. 自动发现与预合并（云端每日执行 + 支持手动触发）
 
-   有未提交改动时先检查并提交或另行保存。若 `git merge --ff-only` 失败，说明本地 `main` 偏离了 `upstream/main`，应先查明原因再继续。
+[.github/workflows/upstream-sync.yml](../.github/workflows/upstream-sync.yml) 每天北京时间 09:17 自动运行（也可执行 `gh workflow run upstream-sync.yml` 立即触发）：
 
-2. 切回 `personal`，检查上游变更范围后再合并 `upstream/main`。
+1. 自动将 `origin/upstream-main` 快进更新至 `BigPizzaV3/ClaudeMom:main`。
+2. 若 `main` 尚未包含最新上游提交，在 `sync/upstream-main` 尝试合并 `origin/main` 与最新上游：
+   - **无冲突**：自动发起/更新指向 `main` 的同步 PR，立即调用 [ci.yml](../.github/workflows/ci.yml) 执行双平台编译测试与个人定制不变量检查，汇总写入 `ci-gate` 状态。
+   - **发生 Git 冲突或 CI 失败**：自动将同步 PR 转为草稿（标题带 `[CONFLICT]` 或 `[CI FAILED]`），并在 PR 中附上冲突清单与可直接复制给任一 Coding Agent 的修复提示词。
 
-   ```bash
-   git switch personal
-   git log --oneline HEAD..upstream/main
-   git diff --stat HEAD...upstream/main
-   git merge --no-edit upstream/main
-   ```
+### 2. 多 Agent 日常开发与冲突修复
 
-   上游同步统一使用 `merge` 而非 `rebase`：`personal` 推送到 `origin` 且锚定了多个 `local/verified-*` 验证标签，改写提交历史会导致远端分叉并使回退标签脱离主线。遇到冲突时停止打包，检查冲突接口及对应测试并解决后提交；放弃合并可运行 `git merge --abort`。
-   上游实现了同一修复时，不能仅凭「没有 Git 冲突」认定兼容，必须结合源码与回归测试判断是否需要另开清理提交移除冗余兼容逻辑。
+所有接入本仓库的 Coding Agent（Antigravity、Codex、Cursor、Claude Code、grokbot 等）共享根目录 [AGENTS.md](../AGENTS.md)（`CLAUDE.md` 软链同源）：
 
-3. 继续执行「本地验证与打包」和「备份并安装」，验证通过后再推送到 `origin`。
+```bash
+# 新开发或修复一律从最新 main 切分支
+git fetch origin main
+git switch -c feat/<topic> origin/main
 
-## 日常开发、CI 检查与推送策略
+# 提交前执行不变量与全套本地检查
+node scripts/check-invariants.mjs
+node scripts/build-local.mjs --check-only
 
-- **在 `personal` 上开发并推送**：日常改造全部提交到 `personal`。推送到个人 Fork 时显式指定分支名与目标标签，不要运行 `git push --tags`，以免把本地或新增 `v*` 标签推到远端触发发版工作流：
+# 推送并创建指向 main 的 PR
+git push -u origin HEAD
+gh pr create --base main --fill
+```
 
-  ```bash
-  git push -u origin personal
-  ```
+### 3. 本机一键真机实测签收（唯一合入 `main` 的放行通道）
 
-- **查看相对上游的全部差异并运行双平台 CI**：[.github/workflows/ci.yml](../.github/workflows/ci.yml) 只在推送 `main`、触发 `pull_request` 或手动运行 `workflow_dispatch` 时执行 macOS 与 Windows 测试编译。在 `Xavier189/ClaudeMom` 上保持一个从 `personal` 指向 `main` 的长期草稿 PR（保持开启且不合入），即可每次推送 `personal` 自动触发双平台 CI，并在单一页面总览相对于 `main` 的全部个人改动。
-- **向作者上游提交纯净 PR**：不要直接从 `personal` 向 `BigPizzaV3/ClaudeMom` 提 PR。从同步后的 `main` 新建临时分支，只 `git cherry-pick <commit>` 通用修复提交后再提 PR，合入或结束后删除该临时分支。
+当任意 PR（上游同步 PR 或 Agent 功能 PR）的云端 `ci-gate` 变绿后，在本机运行：
 
-## 本地验证与打包
+```bash
+node scripts/verify-pr.mjs <PR编号>
+```
 
-1. 在干净工作区的 `personal` 分支上运行验证与打包命令：
+脚本会在隔离的临时 `git worktree` 中将 PR 预合入最新 `origin/main`，跑完 `check-invariants.mjs` 与 `build-local.mjs` 生成待测 `ClaudeMom.app`，先不覆盖已安装版本而直接启动待测实例供真机验证：
+
+- 输入 `pass`：自动备份 `~/.claude-mom` 与旧 `/Applications/ClaudeMom.app`，安装新包，向 GitHub 上报 `local-verified = success`，执行 Merge Commit 合入 `main`，并在新主线提交上打 `local/verified-YYYYMMDD-HHMMSS` 标签推送到 `origin`。
+- 输入 `fail <原因>`：保留原 `/Applications/ClaudeMom.app` 不变，向 GitHub 上报 `local-verified = failure`，将 PR 退回草稿并自动留言失败原因供 Agent 继续修复。
+- 纯文档/工作流治理 PR（未触碰 `apps/`、`crates/`、`Cargo.*`）可使用 `node scripts/verify-pr.mjs <PR编号> --non-runtime`（仍强制执行全套本地单测与类型检查）。
+
+- **向作者上游提交纯净 PR**：不要从 `main` 直接向 `BigPizzaV3/ClaudeMom` 提 PR。从同步后的 `origin/upstream-main` 新建临时分支，只 `git cherry-pick <commit>` 通用修复提交后再提 PR。
+
+## 手动本地打包与备份命令参考（不经 PR 调试时）
+
+1. 在干净工作区运行验证与打包命令：
 
    ```bash
    node scripts/build-local.mjs
@@ -146,12 +147,11 @@ git branch -vv
    - Code 在空测试目录中发送不调用工具的最小提示，确认能启动会话并收到模型回复。
    - 检查所用模型及本地通道符合配置。测试通过不代表 Cowork、远程控制等其他功能均已验证。
 
-4. 验证通过后，为源码打上本地验证标签，并将 `personal` 与该标签显式推送到个人 Fork 备份。
+4. 日常更新统一推荐通过 `node scripts/verify-pr.mjs <PR编号>` 自动合并 PR 并推送 `local/verified-*` 标签；若仅对已合入 `main` 的当前提交补充打标备份，可显式推送标签（不要直推 `main`）：
 
    ```bash
    verified_tag="local/verified-$(date +%Y%m%d-%H%M%S)"
-   git tag "$verified_tag"
-   git push -u origin personal
+   git tag "$verified_tag" origin/main
    git push origin "refs/tags/$verified_tag"
    ```
 
@@ -199,16 +199,16 @@ git branch -vv
 
 ## 禁止事项与更新边界
 
-个人 Fork 采用“同步上游 `main` → 合并到 `personal` → 本地验证打包 → 备份安装并推送个人 Fork”的日常维护流程，需遵守以下边界：
+个人 Fork 采用“同步上游至 `upstream-main` → 预合并 PR 过 `ci-gate` → `verify-pr.mjs` 本机实测签收合入 `main`”的日常维护流程，需遵守以下边界：
 
 - **禁止点击应用内「检查更新」**：[tauri.conf.json](../apps/claude-mom/src-tauri/tauri.conf.json) 的 `plugins.updater.endpoints` 指向 `https://github.com/BigPizzaV3/ClaudeMom/releases/latest/download/latest.json`，安装它会用原作者发行包覆盖本地构建。
-- **禁止运行 `scripts/release.mjs` 或向 Fork 推送 `v*` 标签**：[release.mjs](../scripts/release.mjs) 要求从 `main` 推送 `v*` 标签触发 [release.yml](../.github/workflows/release.yml)。该工作流依赖作者的 `TAURI_SIGNING_PRIVATE_KEY` 与 6 个 Apple 公证签名 Secret（`MACOS_CERT_P12`、`MACOS_CERT_PASSWORD`、`MACOS_SIGNING_IDENTITY`、`APPLE_API_KEY_P8`、`APPLE_API_KEY_ID`、`APPLE_API_ISSUER_ID`），个人 Fork 缺少凭据会直接失败。
+- **禁止运行 `scripts/release.mjs` 或向 Fork 推送 `v*` 标签**：[release.mjs](../scripts/release.mjs) 已内置原作者仓库校验，且个人 Fork 远端 Ruleset 已封禁 `v*` 标签（[release.yml](../.github/workflows/release.yml) 依赖作者的 `TAURI_SIGNING_PRIVATE_KEY` 与 6 个 Apple 公证签名 Secret，个人 Fork 缺少凭据会直接失败）。
 - **本地开发调试入口**：[relaunch-local.mjs](../scripts/relaunch-local.mjs) 用于开发时启动构建目录内的实例，不会替换 `/Applications/ClaudeMom.app`。
-- **异机备份与离线归档**：把 `personal` 与 `local/verified-*` 推送到 `origin` 可完成源码与验证历史备份，但不包含 `target/` 构建产物与 `~/.claude-mom` 运行配置（含模型凭证）。如需离线全量归档仓库对象，可执行：
+- **异机备份与离线归档**：PR 合入 `main` 及推送 `local/verified-*` 标签可完成源码与验证历史备份，但不包含 `target/` 构建产物与 `~/.claude-mom` 运行配置（含模型凭证）。如需离线全量归档仓库对象，可执行：
 
 ```bash
 git bundle create "$HOME/ClaudeMom-local-source.bundle" --all
 git bundle verify "$HOME/ClaudeMom-local-source.bundle"
 ```
 
-相关入口：[README](../README.md)、[本地构建脚本](../scripts/build-local.mjs)。
+相关入口：[README](../README.md)、[多 Agent 维护契约](../AGENTS.md)、[本地签收脚本](../scripts/verify-pr.mjs)、[本地构建脚本](../scripts/build-local.mjs)。
