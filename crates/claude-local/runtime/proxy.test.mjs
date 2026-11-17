@@ -604,6 +604,18 @@ test("Artifacts shared galleries receive frame arrays instead of load-error stat
   }
 });
 
+test("chats shares and billing pricing keep the array and tax-country contract expected by the web UI", async () => {
+  const shares = await request("/api/organizations/local/shares", { host: "claude.ai" });
+  assert.equal(shares.status, 200);
+  assert.deepEqual(shares.body, []);
+
+  const billing = await request("/api/billing/local/cw_pricing?country=US&seats=1", { host: "claude.ai" });
+  assert.equal(billing.status, 200);
+  assert.equal(typeof billing.body.currency, "string");
+  assert.equal(typeof billing.body.country, "string");
+  assert.equal(typeof billing.body.taxDisplay, "object");
+});
+
 test("general settings can read and update notification preferences without losing other channels", async () => {
   const endpoint = "/api/organizations/notification-test/notification/preferences";
   const initial = await request(endpoint, { host: "claude.ai" });

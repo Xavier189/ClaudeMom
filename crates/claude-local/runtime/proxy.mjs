@@ -699,6 +699,30 @@ function localBootstrap() {
 const friendlyName = (id) => modelLabel(runtime, id).name;
 const friendlyDescription = (id) => modelLabel(runtime, id).description || id;
 
+const MODEL_LOCK_FIELDS = [
+  "disabled",
+  "disabled_reason",
+  "selection_notice",
+  "badge",
+  "tooltip",
+  "notice",
+  "notice_text",
+  "inactive",
+  "min_claude_code_version",
+  "required_plan",
+];
+
+function stripModelLocks(entry, defaults = {}) {
+  if (!entry || typeof entry !== "object") return entry;
+  const clean = { ...entry };
+  for (const field of MODEL_LOCK_FIELDS) delete clean[field];
+  return Object.assign(clean, defaults);
+}
+
+function isUnlockedTemplateModel(entry) {
+  return Boolean(entry && typeof entry === "object" && !entry.disabled && !entry.disabled_reason && !entry.selection_notice && !entry.inactive);
+}
+
 // PoC 数据路径下：把网关池模型并入录制 bootstrap 的模型字段。
 // 原生条目先拿来当新条目的模板；`hideUnroutedModels`（默认开）时最后再把它们删掉，
 // 选择器里只剩池内 provider/model 条目。
@@ -708,16 +732,24 @@ function mergePoolModels(j) {
   const cfg = j.activeOrganization?.claude_ai_bootstrap_models_config;
   if (Array.isArray(cfg)) {
     const seen = new Set(cfg.map((m) => m?.model));
-    const tpl = cfg[0] ?? {};
-    for (const entry of cfg) {
+    const tpl = cfg.find(isUnlockedTemplateModel)
+      ?? cfg.find((m) => m && !m.disabled && !m.disabled_reason && !m.inactive)
+      ?? cfg[0]
+      ?? {};
+    const cleanTpl = stripModelLocks(tpl);
+    for (let i = 0; i < cfg.length; i += 1) {
+      const entry = cfg[i];
       if (entry && runtime.models.includes(entry.model)) {
-        entry.hard_limit = modelWindow(runtime, entry.model);
-        entry.context_window = modelWindow(runtime, entry.model);
+        cfg[i] = {
+          ...stripModelLocks(entry),
+          hard_limit: modelWindow(runtime, entry.model),
+          context_window: modelWindow(runtime, entry.model),
+        };
       }
     }
     for (const id of ids) {
       if (!seen.has(id)) cfg.push({
-        ...tpl,
+        ...structuredClone(cleanTpl),
         model: id,
         name: friendlyName(id),
         description: friendlyDescription(id),
@@ -729,6 +761,9 @@ function mergePoolModels(j) {
   const avail = j.claude_ai_available_models?.models;
   if (Array.isArray(avail)) {
     const seen = new Set(avail.map((m) => m?.model_id));
+    for (const entry of avail) {
+      if (entry && runtime.models.includes(entry.model_id)) entry.minimum_tier = "free";
+    }
     for (const id of ids) {
       if (!seen.has(id)) avail.push({ model_id: id, minimum_tier: "free" });
     }
@@ -737,17 +772,27 @@ function mergePoolModels(j) {
     for (const sel of j.model_selector_config) {
       if (!Array.isArray(sel?.models)) continue;
       const seen = new Set(sel.models.map((m) => m?.id));
-      const tpl = sel.models[0] ?? {};
-      for (const entry of sel.models) {
+      // 免费账号录制的模板（如 a4ced7f85b）首条就是带 disabled:true + upgrade_required 的锁模型；
+      // 优先挑未锁定条目当模板，并对池内新增及同名命中条目统一剥离套餐限制与升级弹窗字段。
+      const tpl = sel.models.find(isUnlockedTemplateModel)
+        ?? sel.models.find((m) => m && !m.disabled && !m.disabled_reason && !m.inactive)
+        ?? sel.models[0]
+        ?? {};
+      const cleanTpl = stripModelLocks(tpl, { disabled: false, disabled_reason: null });
+      for (let i = 0; i < sel.models.length; i += 1) {
+        const entry = sel.models[i];
         if (entry && runtime.models.includes(entry.id)) {
-          entry.hard_limit = modelWindow(runtime, entry.id);
-          entry.context_window = modelWindow(runtime, entry.id);
-          entry.runtime = { max_input_tokens: modelWindow(runtime, entry.id) };
+          sel.models[i] = {
+            ...stripModelLocks(entry, { disabled: false, disabled_reason: null }),
+            hard_limit: modelWindow(runtime, entry.id),
+            context_window: modelWindow(runtime, entry.id),
+            runtime: { max_input_tokens: modelWindow(runtime, entry.id) },
+          };
         }
       }
       for (const id of ids) {
         if (!seen.has(id)) sel.models.push({
-          ...tpl,
+          ...structuredClone(cleanTpl),
           id,
           name: friendlyName(id),
           short_name: friendlyName(id),
@@ -1161,6 +1206,9 @@ function mockApi(req, res, url) {
   if (method === "GET" && /^\/api\/organizations\/[^/]+\/user_artifacts\/count$/.test(p)) {
     return json(res, { count: 0 });
   }
+  if (method === "GET" && /^\/api\/organizations\/[^/]+\/shares$/.test(p)) {
+    return json(res, []);
+  }
   if (method === "GET" && /^\/api\/frame\/frames(?:\/external)?$/.test(p)) {
     return json(res, { frames: [] });
   }
@@ -1299,7 +1347,18 @@ function mockApi(req, res, url) {
     });
   }
   if (p.includes("/api/billing/")) {
-    return json(res, { plans: [], prices: [], items: [], currency: "usd", available_plans: [] });
+    return json(res, {
+      plans: [],
+      prices: [],
+      items: [],
+      currency: "usd",
+      country: "US",
+      price: 0,
+      pricePerSeat: 0,
+      taxAmount: null,
+      taxDisplay: { show_included: false, tax_label: null },
+      available_plans: [],
+    });
   }
   if (/eligible$/.test(p)) return json(res, { eligible: false });
 

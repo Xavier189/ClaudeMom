@@ -538,6 +538,51 @@ test("installed templates come in recorded versions and the chosen one is used, 
   assert.deepEqual(await served({ CLAUDE_LOCAL_TEMPLATE: "../older-build" }), { bootstrap: "newer-build", shell: "newer-build" }, "只认版本目录名");
 });
 
+test("free-tier recorded templates unlock merged pool models and matched native models across all selectors", async () => {
+  const runtimeDir = path.join(root, "unlocked-template-runtime");
+  fs.cpSync(path.join(root, "runtime"), runtimeDir, { recursive: true });
+  const mock = path.join(runtimeDir, "mock");
+  fs.rmSync(mock, { recursive: true, force: true });
+  fs.mkdirSync(mock, { recursive: true });
+  fs.writeFileSync(path.join(mock, ".codex-plus-template"), "");
+  fs.cpSync(path.join(here, "mock-templates", "a4ced7f85b"), path.join(mock, "a4ced7f85b"), { recursive: true });
+  const pool = ["alpha/claude-opus-4-6", "claude-opus-4-6"];
+  const instance = await start({
+    CLAUDE_LOCAL_CACHE_DIR: path.join(runtimeDir, ".cache"),
+    CLAUDE_LOCAL_GATEWAY_MODEL: pool[0],
+    CLAUDE_LOCAL_GATEWAY_MODELS: JSON.stringify(pool),
+  }, runtimeDir);
+  try {
+    const bootstrap = (await request(instance, "/edge-api/bootstrap", { host: "claude.ai" })).json;
+    for (const surface of ["chat", "code", "cc", "ccr", "ccd", "cowork"]) {
+      const selector = bootstrap.model_selector_config.find((entry) => entry.id === surface);
+      assert.ok(selector, surface);
+      assert.deepEqual(selector.models.map((entry) => entry.id).sort(), [...pool].sort(), surface);
+      for (const entry of selector.models) {
+        assert.equal(entry.disabled, false, `${surface}:${entry.id}.disabled`);
+        assert.equal(entry.disabled_reason, null, `${surface}:${entry.id}.disabled_reason`);
+        for (const forbidden of [
+          "selection_notice",
+          "badge",
+          "tooltip",
+          "notice",
+          "notice_text",
+          "inactive",
+          "min_claude_code_version",
+          "required_plan",
+        ]) {
+          assert.equal(entry[forbidden], undefined, `${surface}:${entry.id}.${forbidden}`);
+        }
+      }
+    }
+    for (const available of bootstrap.claude_ai_available_models.models) {
+      assert.equal(available.minimum_tier, "free", available.model_id);
+    }
+  } finally {
+    await stop(instance);
+  }
+});
+
 test("installed template with its own shell never serves an online or cached shell of another build", async () => {
   // 新用户没有缓存时会从 claude.ai 拉到当前线上版本，与按旧版本录制的模板对不上（界面错乱、Code 页卡住）。
   // 模板自带同一次录制的外壳时，主站页面导航一律用它；已经缓存了线上新版本的老用户也恢复。
