@@ -51,6 +51,8 @@ export function parseVerifyArgs(argv) {
       flags.add("help");
     } else if (arg === "--wait-ci") {
       flags.add("waitCi");
+    } else if (arg === "--local-ci") {
+      flags.add("localCi");
     } else if (arg === "--non-runtime") {
       flags.add("nonRuntime");
     } else if (arg === "--no-install") {
@@ -65,6 +67,7 @@ export function parseVerifyArgs(argv) {
     prNumber,
     help: flags.has("help"),
     waitCi: flags.has("waitCi"),
+    localCi: flags.has("localCi"),
     nonRuntime: flags.has("nonRuntime"),
     noInstall: flags.has("noInstall"),
   };
@@ -133,7 +136,7 @@ async function ensureCiGatePassed(repo, pr, waitCi) {
   }
 }
 
-function postCommitStatus(repo, sha, state, description) {
+function postCommitStatus(repo, sha, state, description, context = "local-verified") {
   runCapture("gh", [
     "api",
     "-X",
@@ -142,7 +145,7 @@ function postCommitStatus(repo, sha, state, description) {
     "-f",
     `state=${state}`,
     "-f",
-    "context=local-verified",
+    `context=${context}`,
     "-f",
     `description=${description.slice(0, 135)}`,
   ]);
@@ -228,7 +231,11 @@ async function main() {
   console.log(`• 准备验收 PR #${pr.number}: ${pr.title}`);
   console.log(`  分支：${pr.headRefName} @ ${pr.headRefOid.slice(0, 12)} -> ${pr.baseRefName}`);
 
-  await ensureCiGatePassed(repo, pr, opts.waitCi);
+  if (!opts.localCi) {
+    await ensureCiGatePassed(repo, pr, opts.waitCi);
+  } else {
+    console.log("• 已启用 --local-ci：将在隔离 worktree 中完整执行本地不变量与全量测试以替代云端 Actions Runner");
+  }
 
   runInherit("git", ["fetch", "origin", "main", "upstream-main", `pull/${pr.number}/head`]);
   const latestPr = getPrInfo(repo, opts.prNumber);
@@ -264,12 +271,19 @@ async function main() {
     );
 
     runInherit(process.execPath, ["scripts/check-invariants.mjs"], worktreeDir);
+    runInherit(process.execPath, ["--test", "scripts/check-invariants.test.mjs", "scripts/verify-pr.test.mjs", "scripts/sync-upstream.test.mjs"], worktreeDir);
 
     if (opts.nonRuntime) {
       runInherit(process.execPath, ["scripts/build-local.mjs", "--check-only"], worktreeDir);
+      if (opts.localCi) {
+        postCommitStatus(repo, pr.headRefOid, "success", `Local CI checks passed on macOS (${stamp})`, "ci-gate");
+      }
       postCommitStatus(repo, pr.headRefOid, "success", `Non-runtime PR verified locally (${stamp})`);
     } else {
       runInherit(process.execPath, ["scripts/build-local.mjs"], worktreeDir);
+      if (opts.localCi) {
+        postCommitStatus(repo, pr.headRefOid, "success", `Local CI & release build passed on macOS (${stamp})`, "ci-gate");
+      }
       const stagedBundle = path.join(worktreeDir, "target", "release", "bundle", "macos", "ClaudeMom.app");
       const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
       try {

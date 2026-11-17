@@ -26,10 +26,11 @@ test("classifyChangedFiles distinguishes runtime/app changes from governance/doc
 });
 
 test("parseVerifyArgs parses PR numbers and flags strictly", () => {
-  assert.deepEqual(parseVerifyArgs(["#12", "--wait-ci", "--non-runtime"]), {
+  assert.deepEqual(parseVerifyArgs(["#12", "--wait-ci", "--local-ci", "--non-runtime"]), {
     prNumber: 12,
     help: false,
     waitCi: true,
+    localCi: true,
     nonRuntime: true,
     noInstall: false,
   });

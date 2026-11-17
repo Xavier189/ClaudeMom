@@ -1,8 +1,7 @@
 # 自动跟踪原作者仓库 BigPizzaV3/ClaudeMom 更新：
-#   1. 快进更新本仓库干净镜像分支 upstream-main
-#   2. 若 main 尚未包含上游最新提交，在 sync/upstream-main 预合并并创建/更新指向 main 的 PR
-#   3. 无冲突时自动串联 CI（双平台编译测试 + 个人定制不变量守卫），随后等待维护者本机实测签收（local-verified）
-#   4. 发生 Git 冲突或 CI 红灯时自动转为草稿 PR 并附带可直接交给任意 Coding Agent 执行的修复指令
+#   1. 调用 scripts/sync-upstream.mjs 快进更新 upstream-main，并在有未合入更新时创建/更新 sync/upstream-main -> main PR
+#   2. 无冲突时自动串联 CI（双平台编译测试 + 个人定制不变量守卫），随后等待维护者本机实测签收（local-verified）
+#   3. 发生 Git 冲突或 CI 红灯时自动转为草稿 PR 并附带可直接交给任意 Coding Agent 执行的修复指令
 name: Upstream Sync
 
 on:
@@ -35,193 +34,24 @@ jobs:
       pr_number: ${{ steps.sync_pr.outputs.pr_number }}
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      UPSTREAM_REPO_URL: https://github.com/BigPizzaV3/ClaudeMom.git
-      FORCE_RESYNC: ${{ inputs.force_resync || false }}
-      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - name: 同步镜像分支并准备预合并 PR
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: 执行上游同步与预合并检查
         id: sync_pr
         shell: bash
         run: |
-          set -euo pipefail
-
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-
-          git remote add upstream "$UPSTREAM_REPO_URL" 2>/dev/null || git remote set-url upstream "$UPSTREAM_REPO_URL"
-          git fetch upstream main --no-tags
-          git fetch origin main upstream-main
-
-          UPSTREAM_SHA=$(git rev-parse upstream/main)
-          UPSTREAM_SHORT=${UPSTREAM_SHA:0:7}
-          MIRROR_SHA=$(git rev-parse origin/upstream-main)
-          MAIN_SHA=$(git rev-parse origin/main)
-
-          echo "Upstream main : $UPSTREAM_SHA"
-          echo "Mirror branch : $MIRROR_SHA"
-          echo "Personal main : $MAIN_SHA"
-
-          # 1. 快进更新干净镜像分支 upstream-main
-          if [ "$MIRROR_SHA" != "$UPSTREAM_SHA" ]; then
-            if ! git merge-base --is-ancestor "$MIRROR_SHA" "$UPSTREAM_SHA"; then
-              echo "✗ 上游 main 发生了非快进历史改写 ($MIRROR_SHA -> $UPSTREAM_SHA)，拒绝自动覆盖镜像分支，请人工核查。" >&2
-              exit 1
-            fi
-            git push origin "${UPSTREAM_SHA}:refs/heads/upstream-main"
-            echo "✓ 已快进更新 origin/upstream-main -> $UPSTREAM_SHORT"
-          else
-            echo "• origin/upstream-main 已与上游一致 ($UPSTREAM_SHORT)"
+          args=()
+          if [ "${{ inputs.force_resync }}" = "true" ]; then
+            args+=("--force-resync")
           fi
-
-          # 2. 若 main 已包含最新上游提交，无需创建同步 PR
-          if git merge-base --is-ancestor "$UPSTREAM_SHA" "$MAIN_SHA"; then
-            echo "✓ main 已包含上游最新提交 ($UPSTREAM_SHORT)，无需同步。"
-            existing_pr=$(gh pr list --repo "$GITHUB_REPOSITORY" --head sync/upstream-main --base main --state open --json number -q '.[0].number // empty')
-            if [ -n "$existing_pr" ]; then
-              gh pr close "$existing_pr" --repo "$GITHUB_REPOSITORY" --comment "上游提交 \`$UPSTREAM_SHORT\` 已包含在 \`main\` 中，自动关闭已过期的同步 PR。" --delete-branch
-            fi
-            echo "needs_ci=false" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
-          # 3. 幂等保护：若已有针对同一上游提交的打开 PR，默认不覆盖（保护正在进行的 Agent 修复）
-          existing_json=$(gh pr list --repo "$GITHUB_REPOSITORY" --head sync/upstream-main --base main --state open --json number,headRefOid,isDraft -q '.[0] // empty')
-          existing_pr=""
-          if [ -n "$existing_json" ]; then
-            existing_pr=$(printf '%s' "$existing_json" | jq -r '.number')
-            existing_head=$(printf '%s' "$existing_json" | jq -r '.headRefOid')
-            git fetch origin "refs/heads/sync/upstream-main:refs/remotes/origin/sync-head" 2>/dev/null || true
-            if [ "$FORCE_RESYNC" != "true" ] && git merge-base --is-ancestor "$UPSTREAM_SHA" "$existing_head" 2>/dev/null; then
-              echo "• PR #$existing_pr 已包含上游提交 $UPSTREAM_SHORT ($existing_head)，跳过重建以保护现有分支状态。"
-              echo "needs_ci=false" >> "$GITHUB_OUTPUT"
-              echo "pr_number=$existing_pr" >> "$GITHUB_OUTPUT"
-              echo "pr_head_sha=$existing_head" >> "$GITHUB_OUTPUT"
-              exit 0
-            fi
-          fi
-
-          # 4. 汇总本次上游变更与定制模块重叠预警
-          COMMIT_LOG=$(git log --oneline "${MAIN_SHA}..${UPSTREAM_SHA}" | head -n 40)
-          HOT_FILES=$(git diff --name-only "$(git merge-base "$MAIN_SHA" "$UPSTREAM_SHA")..${UPSTREAM_SHA}" -- \
-            apps/claude-mom/src-tauri/src/upstreams.rs \
-            apps/claude-mom/src/ClaudeMomApp.tsx \
-            apps/claude-mom/src/model.ts \
-            apps/claude-mom/src-tauri/tauri.conf.json \
-            crates/claude-local/runtime/proxy.mjs \
-            crates/claude-local/src/backend.rs || true)
-
-          if [ -n "$HOT_FILES" ]; then
-            OVERLAP_SECTION=$(printf "### ⚠️ 个人定制高敏感文件重叠提醒\n上游本次修改触碰了以下含个人定制的文件（即使无 Git 冲突也请重点核查语义兼容）：\n%s\n" "$(printf '%s\n' "$HOT_FILES" | sed 's/^/- `/; s/$/`/')" )
-          else
-            OVERLAP_SECTION="### ✅ 定制文件重叠检查\n上游本次未直接修改核心个人定制文件。"
-          fi
-
-          # 5. 尝试将上游合并入最新 main
-          git checkout -B sync/upstream-main "$MAIN_SHA"
-          if git merge --no-edit -m "chore(sync): merge upstream/main (${UPSTREAM_SHORT}) into main" "$UPSTREAM_SHA"; then
-            PR_HEAD_SHA=$(git rev-parse HEAD)
-            git push --force origin sync/upstream-main
-
-            TITLE="chore(sync): 同步上游 main (${UPSTREAM_SHORT})"
-            cat <<EOF > pr-body.md
-          ## 自动上游同步预合并 (\`${UPSTREAM_SHORT}\`)
-
-          - **上游源提交**：[\`${UPSTREAM_SHORT}\`](https://github.com/BigPizzaV3/ClaudeMom/commit/${UPSTREAM_SHA})
-          - **合并状态**：✅ Git 自动合并无冲突（正运行双平台 CI 与个人定制不变量检查）
-
-          ### 本次纳入的上游提交
-          \`\`\`text
-          ${COMMIT_LOG}
-          \`\`\`
-
-          ${OVERLAP_SECTION}
-
-          ### 本机实测与合入门禁
-          待云端 \`ci-gate\` 变绿后，在本机终端执行以下命令完成打包、Claude Desktop 真机实测并自动合入 \`main\`：
-          \`\`\`bash
-          node scripts/verify-pr.mjs <PR编号>
-          \`\`\`
-          EOF
-
-            if [ -n "$existing_pr" ]; then
-              gh pr edit "$existing_pr" --repo "$GITHUB_REPOSITORY" --title "$TITLE" --body-file pr-body.md
-              gh pr ready "$existing_pr" --repo "$GITHUB_REPOSITORY" 2>/dev/null || true
-              PR_NUM="$existing_pr"
-            else
-              PR_URL=$(gh pr create --repo "$GITHUB_REPOSITORY" --base main --head sync/upstream-main --title "$TITLE" --body-file pr-body.md)
-              PR_NUM="${PR_URL##*/}"
-            fi
-
-            gh api -X POST "repos/${GITHUB_REPOSITORY}/statuses/${PR_HEAD_SHA}" \
-              -f state="pending" \
-              -f context="ci-gate" \
-              -f description="Running cross-platform CI and personal invariants check..." \
-              -f target_url="$RUN_URL" >/dev/null
-
-            echo "needs_ci=true" >> "$GITHUB_OUTPUT"
-            echo "pr_head_sha=$PR_HEAD_SHA" >> "$GITHUB_OUTPUT"
-            echo "pr_number=$PR_NUM" >> "$GITHUB_OUTPUT"
-            echo "✓ 已创建/更新无冲突同步 PR #$PR_NUM ($PR_HEAD_SHA)"
-          else
-            # 发生 Git 冲突：记录冲突清单，回退并将 sync/upstream-main 指向 UPSTREAM_SHA 以原生展示冲突并转草稿 PR
-            CONFLICT_FILES=$(git diff --name-only --diff-filter=U || true)
-            git merge --abort
-            git checkout -B sync/upstream-main "$UPSTREAM_SHA"
-            git push --force origin sync/upstream-main
-
-            TITLE="chore(sync): [CONFLICT] 同步上游 main (${UPSTREAM_SHORT}) 存在合并冲突"
-            CONFLICT_LIST=$(printf '%s\n' "$CONFLICT_FILES" | sed '/^$/d; s/^/- `/; s/$/`/')
-
-            cat <<EOF > pr-body.md
-          ## ⚠️ 自动上游同步检测到 Git 合并冲突 (\`${UPSTREAM_SHORT}\`)
-
-          - **上游源提交**：[\`${UPSTREAM_SHORT}\`](https://github.com/BigPizzaV3/ClaudeMom/commit/${UPSTREAM_SHA})
-          - **合并状态**：❌ 存在代码冲突，已拦截合并并转为草稿 PR
-
-          ### 冲突文件清单
-          ${CONFLICT_LIST}
-
-          ### 本次上游提交
-          \`\`\`text
-          ${COMMIT_LOG}
-          \`\`\`
-
-          ${OVERLAP_SECTION}
-
-          ### 🤖 可直接复制给任意 Coding Agent（Antigravity / Codex / Cursor / grokbot）的修复指令
-          \`\`\`text
-          请阅读仓库根目录 AGENTS.md，修复上游同步 PR 分支 sync/upstream-main 与 origin/main 的合并冲突：
-          1. git fetch origin --prune && git switch -C sync/upstream-main origin/main
-          2. git merge origin/upstream-main（冲突文件：$(echo "$CONFLICT_FILES" | tr '\n' ' ')）
-          3. 对照 AGENTS.md 第 3 节保留全部个人定制逻辑与测试，解决冲突并完成 merge commit（确保提交身份符合 AGENTS.md 脱敏规范）
-          4. 运行 node scripts/check-invariants.mjs 与 node scripts/build-local.mjs --check-only 全部通过后，执行 git push --force-with-lease origin sync/upstream-main
-          \`\`\`
-          EOF
-
-            if [ -n "$existing_pr" ]; then
-              gh pr edit "$existing_pr" --repo "$GITHUB_REPOSITORY" --title "$TITLE" --body-file pr-body.md
-              gh pr ready --undo "$existing_pr" --repo "$GITHUB_REPOSITORY" 2>/dev/null || true
-              PR_NUM="$existing_pr"
-            else
-              PR_URL=$(gh pr create --draft --repo "$GITHUB_REPOSITORY" --base main --head sync/upstream-main --title "$TITLE" --body-file pr-body.md)
-              PR_NUM="${PR_URL##*/}"
-            fi
-
-            gh api -X POST "repos/${GITHUB_REPOSITORY}/statuses/${UPSTREAM_SHA}" \
-              -f state="failure" \
-              -f context="ci-gate" \
-              -f description="Merge conflict with main — resolve on sync/upstream-main" \
-              -f target_url="$RUN_URL" >/dev/null
-
-            echo "needs_ci=false" >> "$GITHUB_OUTPUT"
-            echo "pr_head_sha=$UPSTREAM_SHA" >> "$GITHUB_OUTPUT"
-            echo "pr_number=$PR_NUM" >> "$GITHUB_OUTPUT"
-            echo "⚠️ 已创建/更新冲突草稿 PR #$PR_NUM"
-          fi
+          node scripts/sync-upstream.mjs "${args[@]}"
 
   verify-sync-pr:
     name: Run CI on Sync PR
