@@ -14,11 +14,11 @@
 
 | 引用名 | 类型 | 规则与用途 |
 | --- | --- | --- |
-| `main` | 默认主分支 | **个人长期黄金主线**；服务端开启 Ruleset 禁止直推与强推，必须经 PR 通过 `ci-gate` 与 `local-verified` 双状态检查后以 Merge Commit 合入 |
+| `main` | 默认主分支 | **个人长期黄金主线**；服务端开启 Ruleset 禁止直推与强推，必须经 PR 验证通过后以 Merge Commit 合入（已停用 GitHub Actions） |
 | `upstream-main` | 镜像分支 | **作者上游干净镜像**；服务端禁止强推与删除，仅通过 `--ff-only` 同步 `upstream/main`，不在该分支提交任何个人改动 |
-| `sync/upstream-main` | 同步分支 | 由 [upstream-sync.yml](../.github/workflows/upstream-sync.yml) 自动维护的上游同步 PR 分支 |
+| `sync/upstream-main` | 同步分支 | 由 [sync-upstream.mjs](../scripts/sync-upstream.mjs) 自动维护的上游同步 PR 分支 |
 | `local/verified-YYYYMMDD-HHMMSS` | 标签 | 本机完成真机交互验收并合入 `main` 后的回退锚点标签 |
-| `v*`（例如 `v0.1.7`） | 标签 | 上游发版标签；服务端 Ruleset 已封禁在个人 Fork 创建或更新 `v*` 标签，防止误触发 [release.yml](../.github/workflows/release.yml) |
+| `v*`（例如 `v0.1.7`） | 标签 | 上游发版标签；服务端 Ruleset 已封禁在个人 Fork 创建或更新 `v*` 标签 |
 
 ## 检查或初始化仓库远端与本地钩子
 
@@ -43,20 +43,24 @@ git config core.hooksPath .githooks
 
 - **核对提交脱敏身份**：确认 `git config user.name` 为 `Xavier189` 且 `user.email` 为 `63280269+Xavier189@users.noreply.github.com`（本地 `.githooks/pre-commit` 与云端 [check-invariants.mjs](../scripts/check-invariants.mjs) 均会强制拦截私人用户名或公司邮箱）。
 
-## 自动上游同步与 PR 签收工作流
+## 自动上游同步与 PR 验证工作流（grokbot + 多 Agent + 本机）
 
-### 1. 自动发现与预合并（云端每日执行 + 支持手动触发）
+### 1. 主动发现上游更新并创建预合并 PR
 
-[.github/workflows/upstream-sync.yml](../.github/workflows/upstream-sync.yml) 每天北京时间 09:17 自动运行（也可执行 `gh workflow run upstream-sync.yml` 触发云端任务，或直接在本机运行 `node scripts/sync-upstream.mjs` 立即执行同等同步逻辑）：
+由 `grokbot` 定时任务或本机直接运行 [scripts/sync-upstream.mjs](../scripts/sync-upstream.mjs)：
+
+```bash
+node scripts/sync-upstream.mjs
+```
 
 1. 自动将 `origin/upstream-main` 快进更新至 `BigPizzaV3/ClaudeMom:main`。
-2. 若 `main` 尚未包含最新上游提交，在 `sync/upstream-main` 尝试合并 `origin/main` 与最新上游：
-   - **无冲突**：自动发起/更新指向 `main` 的同步 PR，立即调用 [ci.yml](../.github/workflows/ci.yml) 执行 macOS 编译测试与个人定制不变量检查，汇总写入 `ci-gate` 状态。
-   - **发生 Git 冲突或 CI 失败**：自动将同步 PR 转为草稿（标题带 `[CONFLICT]` 或 `[CI FAILED]`），并在 PR 中附上冲突清单与可直接复制给任一 Coding Agent 的修复提示词。
+2. 若 `main` 尚未包含最新上游提交，在隔离 `worktree` 尝试预合并 `origin/main` 与最新上游：
+   - **无冲突**：自动发起/更新指向 `main` 的同步 PR，附带上游提交清单与个人定制敏感文件重叠提醒。
+   - **发生 Git 冲突**：自动将同步 PR 转为标题带 `[CONFLICT]` 的草稿 PR，并在正文中附上冲突文件清单与现成的 Agent 修复指令。
 
 ### 2. 多 Agent 日常开发与冲突修复
 
-所有接入本仓库的 Coding Agent（Antigravity、Codex、Cursor、Claude Code、grokbot 等）共享根目录 [AGENTS.md](../AGENTS.md)（`CLAUDE.md` 软链同源）：
+所有接入本仓库的 Coding Agent（grokbot、Antigravity、Codex、Cursor、Claude Code 等）共享根目录 [AGENTS.md](../AGENTS.md)（`CLAUDE.md` 软链同源）：
 
 ```bash
 # 新开发或修复一律从最新 main 切分支
@@ -72,20 +76,21 @@ git push -u origin HEAD
 gh pr create --base main --fill
 ```
 
-### 3. 本机一键真机实测签收（唯一合入 `main` 的放行通道）
+### 3. PR 验证与合入 `main`（支持 grokbot 自动验证与本机真机签收）
 
-当任意 PR（上游同步 PR 或 Agent 功能 PR）的云端 `ci-gate` 变绿后，在本机运行：
+- **方式 A（grokbot / 自动化 Agent 一键拉取验证并合入）**：
+  ```bash
+  node scripts/verify-pr.mjs <PR编号> --auto
+  ```
+  脚本在隔离 `git worktree` 中将 PR 预合入最新 `origin/main`，依次运行 `check-invariants.mjs`、治理单测与 `build-local.mjs --check-only`（前端检查 + Rust 测试 + Node 运行时测试）。全部通过则自动以 Merge Commit 合入 `main` 并清理源分支；若合并冲突或任一检查失败，自动把 PR 退回草稿并评论失败详情供修复（若只验证不合并可传 `--check-only`）。
 
-```bash
-node scripts/verify-pr.mjs <PR编号>
-```
-
-脚本会在隔离的临时 `git worktree` 中将 PR 预合入最新 `origin/main`，跑完 `check-invariants.mjs` 与 `build-local.mjs` 生成待测 `ClaudeMom.app`，先不覆盖已安装版本而直接启动待测实例供真机验证：
-
-- 输入 `pass`：自动备份 `~/.claude-mom` 与旧 `/Applications/ClaudeMom.app`，安装新包，向 GitHub 上报 `local-verified = success`，执行 Merge Commit 合入 `main`，并在新主线提交上打 `local/verified-YYYYMMDD-HHMMSS` 标签推送到 `origin`。
-- 输入 `fail <原因>`：保留原 `/Applications/ClaudeMom.app` 不变，向 GitHub 上报 `local-verified = failure`，将 PR 退回草稿并自动留言失败原因供 Agent 继续修复。
-- 纯文档/工作流治理 PR（未触碰 `apps/`、`crates/`、`Cargo.*`）可使用 `node scripts/verify-pr.mjs <PR编号> --non-runtime`（仍强制执行全套本地单测与类型检查）。
-- 若云端 GitHub Actions Runner 暂不可用，可追加 `--local-ci` 在本机隔离 worktree 内完整跑完不变量与测试套件并上报 `ci-gate`。
+- **方式 B（维护者本机打包 `.app` 真机实测签收并安装）**：
+  ```bash
+  node scripts/verify-pr.mjs <PR编号>
+  ```
+  完整编译待测 `ClaudeMom.app`，先不覆盖已安装版本而直接启动待测实例供 Claude Desktop 真机交互验证：
+  - 输入 `pass`：自动备份 `~/.claude-mom` 与旧 `/Applications/ClaudeMom.app`，安装新包，执行 Merge Commit 合入 `main`，并打 `local/verified-YYYYMMDD-HHMMSS` 标签推送到 `origin`。
+  - 输入 `fail <原因>`：保留原 `/Applications/ClaudeMom.app` 不变，将 PR 退回草稿并留言失败原因供 Agent 继续修复。
 
 - **向作者上游提交纯净 PR**：不要从 `main` 直接向 `BigPizzaV3/ClaudeMom` 提 PR。从同步后的 `origin/upstream-main` 新建临时分支，只 `git cherry-pick <commit>` 通用修复提交后再提 PR。
 
@@ -200,7 +205,7 @@ node scripts/verify-pr.mjs <PR编号>
 
 ## 禁止事项与更新边界
 
-个人 Fork 采用“同步上游至 `upstream-main` → 预合并 PR 过 `ci-gate` → `verify-pr.mjs` 本机实测签收合入 `main`”的日常维护流程，需遵守以下边界：
+个人 Fork 采用“同步上游至 `upstream-main` → 发起预合并 PR → `grokbot` / 本机 `verify-pr.mjs` 验证合入 `main`”的日常维护流程，需遵守以下边界：
 
 - **禁止点击应用内「检查更新」**：[tauri.conf.json](../apps/claude-mom/src-tauri/tauri.conf.json) 的 `plugins.updater.endpoints` 指向 `https://github.com/BigPizzaV3/ClaudeMom/releases/latest/download/latest.json`，安装它会用原作者发行包覆盖本地构建。
 - **禁止运行 `scripts/release.mjs` 或向 Fork 推送 `v*` 标签**：[release.mjs](../scripts/release.mjs) 已内置原作者仓库校验，且个人 Fork 远端 Ruleset 已封禁 `v*` 标签（[release.yml](../.github/workflows/release.yml) 依赖作者的 `TAURI_SIGNING_PRIVATE_KEY` 与 6 个 Apple 公证签名 Secret，个人 Fork 缺少凭据会直接失败）。

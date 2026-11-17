@@ -1,19 +1,16 @@
 #!/usr/bin/env node
 /**
- * PR 本机实测签收与合并门禁脚本（macOS）
+ * PR 隔离预合并验证与合入门禁脚本（支持 grokbot 无人值守验证合并 & 本机 macOS 真机实测签收）
  *
  * 用法：
- *   node scripts/verify-pr.mjs <PR编号> [--wait-ci] [--no-install]
- *   node scripts/verify-pr.mjs <PR编号> --non-runtime [--wait-ci]
+ *   1. grokbot / Agent 自动验证并合入 main（预合并 + 不变量守卫 + 前端/Rust/Node 全量测试，通过后自动 Merge，失败转草稿并留言）：
+ *      node scripts/verify-pr.mjs <PR编号> --auto
  *
- * 流程：
- *   1. 校验目标 PR 指向 main，且云端必过状态 ci-gate 已成功（--wait-ci 可轮询等待）
- *   2. 在临时 git worktree 将 PR 合入最新 origin/main，运行 check-invariants 与全套构建/测试
- *   3. 运行期代码变更默认启动预构建的 ClaudeMom.app 供真机交互验收：
- *        输入 pass   -> 备份并替换 /Applications/ClaudeMom.app，上报 local-verified=success，Merge 合入 main 并打 local/verified-* 标签
- *        输入 fail   -> 不动已安装 App，上报 local-verified=failure，转为草稿 PR 并留言供 Agent 修复
- *        输入 abort  -> 仅清理临时目录，不改远端状态
- *   4. 纯文档/工作流/脚本治理变更可使用 --non-runtime（一旦触碰 apps/、crates/、Cargo.* 立即拒绝跳过实测）
+ *   2. 仅拉取预合并跑全量检查，不执行合并：
+ *      node scripts/verify-pr.mjs <PR编号> --check-only
+ *
+ *   3. 本机 macOS 打包 .app + Claude Desktop 交互式真机实测签收合入（默认模式）：
+ *      node scripts/verify-pr.mjs <PR编号> [--no-install]
  */
 import { execFileSync, spawn } from "node:child_process";
 import fs from "node:fs";
@@ -24,21 +21,12 @@ import { fileURLToPath } from "node:url";
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
-const RUNTIME_PATH_PREFIXES = [
-  "apps/",
-  "crates/",
-  "Cargo.toml",
-  "Cargo.lock",
-];
-
-export function classifyChangedFiles(files) {
-  const runtimeFiles = files.filter((file) =>
-    RUNTIME_PATH_PREFIXES.some((prefix) => (prefix.endsWith("/") ? file.startsWith(prefix) : file === prefix)),
-  );
-  return {
-    requiresLiveAppTest: runtimeFiles.length > 0,
-    runtimeFiles,
-  };
+export function parseOriginRepoSlug(remoteUrl) {
+  const match = remoteUrl.trim().match(/github\.com[:/]([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+?)(?:\.git)?$/);
+  if (!match) {
+    throw new Error(`无法从 origin URL 解析 GitHub 仓库名：${remoteUrl}`);
+  }
+  return match[1];
 }
 
 export function parseVerifyArgs(argv) {
@@ -47,12 +35,10 @@ export function parseVerifyArgs(argv) {
   for (const arg of argv) {
     if (arg === "--help" || arg === "-h") {
       flags.add("help");
-    } else if (arg === "--wait-ci") {
-      flags.add("waitCi");
-    } else if (arg === "--local-ci") {
-      flags.add("localCi");
-    } else if (arg === "--non-runtime") {
-      flags.add("nonRuntime");
+    } else if (arg === "--auto") {
+      flags.add("auto");
+    } else if (arg === "--check-only") {
+      flags.add("checkOnly");
     } else if (arg === "--no-install") {
       flags.add("noInstall");
     } else if (/^#?\d+$/.test(arg) && prNumber === null) {
@@ -61,18 +47,34 @@ export function parseVerifyArgs(argv) {
       throw new Error(`未知参数 "${arg}"；使用 --help 查看用法`);
     }
   }
+  if (flags.has("auto") && flags.has("checkOnly")) {
+    throw new Error("--auto 与 --check-only 不能同时指定");
+  }
   return {
     prNumber,
     help: flags.has("help"),
-    waitCi: flags.has("waitCi"),
-    localCi: flags.has("localCi"),
-    nonRuntime: flags.has("nonRuntime"),
+    auto: flags.has("auto"),
+    checkOnly: flags.has("checkOnly"),
     noInstall: flags.has("noInstall"),
   };
 }
 
 function runCapture(cmd, args, cwd = REPO_ROOT) {
   return execFileSync(cmd, args, { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim();
+}
+
+function tryCapture(cmd, args, cwd = REPO_ROOT, extraEnv = {}) {
+  try {
+    const out = execFileSync(cmd, args, {
+      cwd,
+      env: { ...process.env, ...extraEnv },
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"],
+    }).trim();
+    return { ok: true, out };
+  } catch (err) {
+    return { ok: false, out: String(err.stderr || err.stdout || err.message || "").trim() };
+  }
 }
 
 function runInherit(cmd, args, cwd = REPO_ROOT, extraEnv = {}) {
@@ -84,14 +86,6 @@ function stampNow() {
   const d = new Date();
   const pad = (n) => String(n).padStart(2, "0");
   return `${d.getFullYear()}${pad(d.getMonth() + 1)}${pad(d.getDate())}-${pad(d.getHours())}${pad(d.getMinutes())}${pad(d.getSeconds())}`;
-}
-
-export function parseOriginRepoSlug(remoteUrl) {
-  const match = remoteUrl.trim().match(/github\.com[:/]([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+?)(?:\.git)?$/);
-  if (!match) {
-    throw new Error(`无法从 origin URL 解析 GitHub 仓库名：${remoteUrl}`);
-  }
-  return match[1];
 }
 
 function getRepoSlug() {
@@ -112,50 +106,23 @@ function getPrInfo(repo, prNumber) {
   return JSON.parse(raw);
 }
 
-function getCommitStatusState(repo, sha, contextName) {
-  const raw = runCapture("gh", ["api", `repos/${repo}/commits/${sha}/status`]);
-  const data = JSON.parse(raw);
-  const match = (data.statuses || []).find((s) => s.context === contextName);
-  return match ? match.state : null;
-}
-
-async function ensureCiGatePassed(repo, pr, waitCi) {
-  const deadline = Date.now() + 30 * 60 * 1000;
-  while (true) {
-    const state = getCommitStatusState(repo, pr.headRefOid, "ci-gate");
-    if (state === "success") {
-      console.log(`✓ 云端门禁 ci-gate 已通过 (${pr.headRefOid.slice(0, 7)})`);
-      return;
-    }
-    if (state === "failure" || state === "error") {
-      throw new Error(`PR #${pr.number} 的云端 ci-gate 状态为 ${state}，请先修复云端 CI 后再实测签收：${pr.url}`);
-    }
-    if (!waitCi) {
-      throw new Error(
-        `PR #${pr.number} 的 ci-gate 当前状态为 ${state || "pending/未上报"}；可追加 --wait-ci 自动等待云端检查完成：${pr.url}`,
-      );
-    }
-    if (Date.now() > deadline) {
-      throw new Error(`等待 PR #${pr.number} 云端 ci-gate 超时（30 分钟）`);
-    }
-    console.log(`⏳ 等待云端 ci-gate 完成（当前：${state || "pending"}），15 秒后重试…`);
-    await new Promise((resolve) => setTimeout(resolve, 15_000));
+function reportFailureToPr(repo, pr, stamp, stageTitle, detail) {
+  if (!pr.isDraft) {
+    tryCapture("gh", ["pr", "ready", "--undo", String(pr.number), "--repo", repo]);
   }
-}
-
-function postCommitStatus(repo, sha, state, description, context = "local-verified") {
-  runCapture("gh", [
-    "api",
-    "-X",
-    "POST",
-    `repos/${repo}/statuses/${sha}`,
-    "-f",
-    `state=${state}`,
-    "-f",
-    `context=${context}`,
-    "-f",
-    `description=${description.slice(0, 135)}`,
-  ]);
+  const snippet = detail.length > 3000 ? `${detail.slice(-3000)}` : detail;
+  const body = [
+    `### ❌ PR 自动验证未通过：${stageTitle} (${stamp})`,
+    "",
+    `- **提交**：\`${pr.headRefOid.slice(0, 12)}\` (\`${pr.headRefName}\`)`,
+    "",
+    "```text",
+    snippet || "(详见终端日志)",
+    "```",
+    "",
+    `请对照根目录 \`AGENTS.md\` 在 \`${pr.headRefName}\` 分支修复后重新推送，再重新执行验证。`,
+  ].join("\n");
+  tryCapture("gh", ["pr", "comment", String(pr.number), "--repo", repo, "--body", body]);
 }
 
 function launchCleanApp(bundlePath) {
@@ -213,14 +180,9 @@ async function main() {
     console.log(
       [
         "用法：",
-        "  node scripts/verify-pr.mjs <PR编号> [--wait-ci] [--no-install]",
-        "  node scripts/verify-pr.mjs <PR编号> --non-runtime [--wait-ci]",
-        "",
-        "说明：",
-        "  • 默认在隔离 worktree 合并最新 origin/main 并构建 ClaudeMom.app，交互式完成 Claude Desktop 实测后签收合入 main。",
-        "  • --non-runtime 仅允许在 PR 未触碰 apps/、crates/、Cargo.* 等运行期文件时使用（仍强制跑完全量本地测试）。",
-        "  • --wait-ci 自动轮询等待云端 ci-gate 完成后再开始本地验证。",
-        "  • --no-install 实测通过后只签收合并 PR，不替换 /Applications/ClaudeMom.app。",
+        "  node scripts/verify-pr.mjs <PR编号> --auto          # grokbot / Agent 无人值守预合并验证 + 通过后自动合入 main",
+        "  node scripts/verify-pr.mjs <PR编号> --check-only    # 仅预合并验证全套检查，不执行合并",
+        "  node scripts/verify-pr.mjs <PR编号> [--no-install]  # 本机打包 .app + Claude Desktop 真机交互实测后合入 main",
       ].join("\n"),
     );
     process.exit(opts.help ? 0 : 1);
@@ -232,33 +194,16 @@ async function main() {
     throw new Error(`PR #${pr.number} 当前状态为 ${pr.state}（非 OPEN）`);
   }
   if (pr.baseRefName !== "main") {
-    throw new Error(`PR #${pr.number} 目标分支为 ${pr.baseRefName}，本脚本只签收合入 main 的 PR`);
+    throw new Error(`PR #${pr.number} 目标分支为 ${pr.baseRefName}，本脚本只验证合入 main 的 PR`);
   }
 
-  console.log(`• 准备验收 PR #${pr.number}: ${pr.title}`);
+  console.log(`• 开始验证 PR #${pr.number}: ${pr.title}`);
   console.log(`  分支：${pr.headRefName} @ ${pr.headRefOid.slice(0, 12)} -> ${pr.baseRefName}`);
-
-  if (!opts.localCi) {
-    await ensureCiGatePassed(repo, pr, opts.waitCi);
-  } else {
-    console.log("• 已启用 --local-ci：将在隔离 worktree 中完整执行本地不变量与全量测试以替代云端 Actions Runner");
-  }
 
   runInherit("git", ["fetch", "origin", "main", "upstream-main", `pull/${pr.number}/head`]);
   const latestPr = getPrInfo(repo, opts.prNumber);
   if (latestPr.headRefOid !== pr.headRefOid) {
-    throw new Error(`PR #${pr.number} 在拉取期间有新提交 (${latestPr.headRefOid.slice(0, 7)})，请重新运行验收`);
-  }
-
-  const changedFiles = runCapture("git", ["diff", "--name-only", `origin/main...${pr.headRefOid}`])
-    .split("\n")
-    .filter(Boolean);
-  const { requiresLiveAppTest, runtimeFiles } = classifyChangedFiles(changedFiles);
-
-  if (opts.nonRuntime && requiresLiveAppTest) {
-    throw new Error(
-      `该 PR 修改了运行期/构建关键文件，禁止使用 --non-runtime 跳过真机实测：\n  - ${runtimeFiles.join("\n  - ")}`,
-    );
+    throw new Error(`PR #${pr.number} 在拉取期间产生新提交 (${latestPr.headRefOid.slice(0, 7)})，请重新执行`);
   }
 
   const stamp = stampNow();
@@ -269,28 +214,41 @@ async function main() {
     runInherit("git", ["worktree", "add", "--detach", worktreeDir, "origin/main"]);
     worktreeAdded = true;
 
-    // 在临时 worktree 预合并 PR，确保检验的是合入最新 main 后的真实产物
-    runInherit(
-      "git",
-      ["merge", "--no-ff", "--no-edit", pr.headRefOid],
-      worktreeDir,
-      { ALLOW_MAIN_COMMIT: "1" },
-    );
-
-    runInherit(process.execPath, ["scripts/check-invariants.mjs"], worktreeDir);
-    runInherit(process.execPath, ["--test", "scripts/check-invariants.test.mjs", "scripts/verify-pr.test.mjs", "scripts/sync-upstream.test.mjs"], worktreeDir);
-
-    if (opts.nonRuntime) {
-      runInherit(process.execPath, ["scripts/build-local.mjs", "--check-only"], worktreeDir);
-      if (opts.localCi) {
-        postCommitStatus(repo, pr.headRefOid, "success", `Local CI checks passed on macOS (${stamp})`, "ci-gate");
+    const mergeRes = tryCapture("git", ["merge", "--no-ff", "--no-edit", pr.headRefOid], worktreeDir, { ALLOW_MAIN_COMMIT: "1" });
+    if (!mergeRes.ok) {
+      const conflicts = tryCapture("git", ["diff", "--name-only", "--diff-filter=U"], worktreeDir).out;
+      tryCapture("git", ["merge", "--abort"], worktreeDir);
+      if (opts.auto) {
+        reportFailureToPr(repo, pr, stamp, "与最新 main 存在合并冲突", `冲突文件：\n${conflicts}\n\n${mergeRes.out}`);
       }
-      postCommitStatus(repo, pr.headRefOid, "success", `Non-runtime PR verified locally (${stamp})`);
-    } else {
-      runInherit(process.execPath, ["scripts/build-local.mjs"], worktreeDir);
-      if (opts.localCi) {
-        postCommitStatus(repo, pr.headRefOid, "success", `Local CI & release build passed on macOS (${stamp})`, "ci-gate");
+      throw new Error(`PR #${pr.number} 与最新 origin/main 存在合并冲突：\n${conflicts}`);
+    }
+
+    try {
+      runInherit(process.execPath, ["scripts/check-invariants.mjs"], worktreeDir);
+      runInherit(
+        process.execPath,
+        ["--test", "scripts/check-invariants.test.mjs", "scripts/verify-pr.test.mjs", "scripts/sync-upstream.test.mjs"],
+        worktreeDir,
+      );
+      if (opts.auto || opts.checkOnly) {
+        runInherit(process.execPath, ["scripts/build-local.mjs", "--check-only"], worktreeDir);
+      } else {
+        runInherit(process.execPath, ["scripts/build-local.mjs"], worktreeDir);
       }
+    } catch (checkErr) {
+      if (opts.auto) {
+        reportFailureToPr(repo, pr, stamp, "不变量或构建测试失败", String(checkErr.message || checkErr));
+      }
+      throw checkErr;
+    }
+
+    if (opts.checkOnly) {
+      console.log(`✓ PR #${pr.number} 预合并与全量检查全部通过（--check-only 模式未执行合并）。`);
+      return;
+    }
+
+    if (!opts.auto) {
       const stagedBundle = path.join(worktreeDir, "target", "release", "bundle", "macos", "ClaudeMom.app");
       const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
       try {
@@ -310,19 +268,7 @@ async function main() {
         }
         if (verdict.startsWith("fail")) {
           const reason = verdict.slice(4).trim() || "本机 Claude Desktop 真机实测未通过";
-          postCommitStatus(repo, pr.headRefOid, "failure", `Local E2E failed: ${reason}`);
-          if (!pr.isDraft) {
-            runCapture("gh", ["pr", "ready", "--undo", String(pr.number), "--repo", repo]);
-          }
-          runCapture("gh", [
-            "pr",
-            "comment",
-            String(pr.number),
-            "--repo",
-            repo,
-            "--body",
-            `### ❌ 本机真机实测未通过 (${stamp})\n\n- **提交**：\`${pr.headRefOid.slice(0, 12)}\`\n- **现象与原因**：${reason}\n\n请检出 \`${pr.headRefName}\` 分支修复并通过 \`node scripts/check-invariants.mjs\` 与 \`node scripts/build-local.mjs --check-only\` 后重新推送。`,
-          ]);
+          reportFailureToPr(repo, pr, stamp, "本机 Claude Desktop 真机实测未通过", reason);
           if (fs.existsSync("/Applications/ClaudeMom.app")) {
             launchCleanApp("/Applications/ClaudeMom.app");
           }
@@ -337,7 +283,6 @@ async function main() {
           backupAndInstallApp(stagedBundle, pr.number, stamp);
           launchCleanApp("/Applications/ClaudeMom.app");
         }
-        postCommitStatus(repo, pr.headRefOid, "success", `Local E2E verified on macOS (${stamp})`);
       } finally {
         rl.close();
       }
@@ -355,14 +300,14 @@ async function main() {
       runInherit("git", ["merge", "--ff-only", "origin/main"]);
     }
 
-    if (!opts.nonRuntime) {
+    if (!opts.auto) {
       const verifiedTag = `local/verified-${stamp}`;
       runInherit("git", ["tag", verifiedTag, "origin/main"]);
       runInherit("git", ["push", "origin", `refs/tags/${verifiedTag}`]);
       console.log(`✓ 已创建并推送实测回滚锚点标签：${verifiedTag}`);
     }
 
-    console.log(`✓ PR #${pr.number} 已完成签收并合入 main！`);
+    console.log(`✓ PR #${pr.number} 已验证通过并合入 main！`);
   } finally {
     if (worktreeAdded) {
       try {

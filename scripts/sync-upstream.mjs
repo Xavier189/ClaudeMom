@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * 上游仓库自动同步与预合并 PR 生成脚本（同时支持 GitHub Actions 云端定时与本机终端/launchd 运行）
+ * 上游仓库自动同步与预合并 PR 生成脚本（供 grokbot / Coding Agent / 本机定时调用）
  *
  * 用法：
  *   node scripts/sync-upstream.mjs [--dry-run] [--force-resync]
@@ -36,6 +36,14 @@ export function parseSyncArgs(argv) {
   return { dryRun, forceResync, help };
 }
 
+export function parseOriginRepoSlug(remoteUrl) {
+  const match = remoteUrl.trim().match(/github\.com[:/]([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+?)(?:\.git)?$/);
+  if (!match) {
+    throw new Error(`无法从 origin URL 解析 GitHub 仓库名：${remoteUrl}`);
+  }
+  return match[1];
+}
+
 export function formatOverlapSection(hotFiles) {
   if (hotFiles.length === 0) {
     return "### ✅ 定制文件重叠检查\n上游本次未直接修改核心个人定制文件。";
@@ -65,40 +73,21 @@ function tryExec(cmd, args, cwd = REPO_ROOT, extraEnv = {}) {
   }
 }
 
-function writeGithubOutputs(values) {
-  const outPath = process.env.GITHUB_OUTPUT;
-  if (!outPath) return;
-  const lines = Object.entries(values).map(([k, v]) => `${k}=${v}`);
-  fs.appendFileSync(outPath, `${lines.join("\n")}\n`);
-}
-
-export function parseOriginRepoSlug(remoteUrl) {
-  const match = remoteUrl.trim().match(/github\.com[:/]([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+?)(?:\.git)?$/);
-  if (!match) {
-    throw new Error(`无法从 origin URL 解析 GitHub 仓库名：${remoteUrl}`);
-  }
-  return match[1];
-}
-
 function getRepoSlug() {
-  if (process.env.GITHUB_REPOSITORY) return process.env.GITHUB_REPOSITORY;
   return parseOriginRepoSlug(capture("git", ["remote", "get-url", "origin"]));
 }
 
 function main() {
   const opts = parseSyncArgs(process.argv.slice(2));
   if (opts.help) {
-    console.log("用法：node scripts/sync-upstream.mjs [--dry-run] [--force-resync]\n自动同步 BigPizzaV3/ClaudeMom:main 至 origin/upstream-main，并在有未合入更新时创建/更新 sync/upstream-main -> main 的预合并 PR。");
+    console.log(
+      "用法：node scripts/sync-upstream.mjs [--dry-run] [--force-resync]\n自动同步 BigPizzaV3/ClaudeMom:main 至 origin/upstream-main，并在有未合入更新时创建/更新 sync/upstream-main -> main 的预合并 PR。",
+    );
     return;
   }
 
   const upstreamUrl = process.env.UPSTREAM_REPO_URL || DEFAULT_UPSTREAM_URL;
   const repo = getRepoSlug();
-  const inActions = process.env.GITHUB_ACTIONS === "true";
-  const runUrl =
-    inActions && process.env.GITHUB_SERVER_URL && process.env.GITHUB_RUN_ID
-      ? `${process.env.GITHUB_SERVER_URL}/${repo}/actions/runs/${process.env.GITHUB_RUN_ID}`
-      : "";
 
   if (!tryExec("git", ["remote", "get-url", "upstream"]).ok) {
     capture("git", ["remote", "add", "upstream", upstreamUrl]);
@@ -120,7 +109,9 @@ function main() {
   // 1. 快进更新镜像分支 origin/upstream-main
   if (mirrorSha !== upstreamSha) {
     if (!tryExec("git", ["merge-base", "--is-ancestor", mirrorSha, upstreamSha]).ok) {
-      throw new Error(`上游 main 发生了非快进历史改写 (${mirrorSha.slice(0, 7)} -> ${upstreamShort})，拒绝自动覆盖 upstream-main，请人工核查。`);
+      throw new Error(
+        `上游 main 发生了非快进历史改写 (${mirrorSha.slice(0, 7)} -> ${upstreamShort})，拒绝自动覆盖 upstream-main，请人工核查。`,
+      );
     }
     if (opts.dryRun) {
       console.log(`[dry-run] 将快进推送 origin/upstream-main: ${mirrorSha.slice(0, 7)} -> ${upstreamShort}`);
@@ -136,7 +127,20 @@ function main() {
   if (tryExec("git", ["merge-base", "--is-ancestor", upstreamSha, mainSha]).ok) {
     console.log(`✓ origin/main 已包含上游最新提交 (${upstreamShort})，无需创建同步 PR。`);
     if (!opts.dryRun) {
-      const existingRaw = capture("gh", ["pr", "list", "--repo", repo, "--head", "sync/upstream-main", "--base", "main", "--state", "open", "--json", "number"]);
+      const existingRaw = capture("gh", [
+        "pr",
+        "list",
+        "--repo",
+        repo,
+        "--head",
+        "sync/upstream-main",
+        "--base",
+        "main",
+        "--state",
+        "open",
+        "--json",
+        "number",
+      ]);
       const existing = JSON.parse(existingRaw || "[]");
       if (existing.length > 0) {
         capture("gh", [
@@ -151,24 +155,33 @@ function main() {
         ]);
       }
     }
-    writeGithubOutputs({ needs_ci: "false" });
     return;
   }
 
   // 3. 幂等保护：若已有包含该上游提交的打开 PR，默认不覆盖（保护正在进行的 Agent 修复）
   const openPrs = JSON.parse(
-    capture("gh", ["pr", "list", "--repo", repo, "--head", "sync/upstream-main", "--base", "main", "--state", "open", "--json", "number,headRefOid,isDraft"]) || "[]",
+    capture("gh", [
+      "pr",
+      "list",
+      "--repo",
+      repo,
+      "--head",
+      "sync/upstream-main",
+      "--base",
+      "main",
+      "--state",
+      "open",
+      "--json",
+      "number,headRefOid,isDraft",
+    ]) || "[]",
   );
   const existingPr = openPrs[0] || null;
   if (existingPr && !opts.forceResync) {
     tryExec("git", ["fetch", "origin", "refs/heads/sync/upstream-main"]);
     if (tryExec("git", ["merge-base", "--is-ancestor", upstreamSha, existingPr.headRefOid]).ok) {
-      console.log(`• PR #${existingPr.number} 已包含上游提交 ${upstreamShort} (${existingPr.headRefOid.slice(0, 7)})，跳过重建以保护现有同步分支。`);
-      writeGithubOutputs({
-        needs_ci: "false",
-        pr_number: String(existingPr.number),
-        pr_head_sha: existingPr.headRefOid,
-      });
+      console.log(
+        `• PR #${existingPr.number} 已包含上游提交 ${upstreamShort} (${existingPr.headRefOid.slice(0, 7)})，跳过重建以保护现有同步分支。`,
+      );
       return;
     }
   }
@@ -180,28 +193,18 @@ function main() {
     .filter(Boolean);
   const overlapSection = formatOverlapSection(hotFiles);
 
-  // 4. 在隔离临时 worktree 中执行合并试探，绝不污染本机当前工作区
+  // 4. 在隔离临时 worktree 中执行合并试探，不污染当前工作区
   const worktreeDir = fs.mkdtempSync(path.join(os.tmpdir(), "claudemom-upstream-sync-"));
   let worktreeAdded = false;
   try {
     capture("git", ["worktree", "add", "--detach", worktreeDir, mainSha]);
     worktreeAdded = true;
 
-    const mergeEnv = inActions
-      ? {
-          ALLOW_MAIN_COMMIT: "1",
-          GIT_AUTHOR_NAME: "github-actions[bot]",
-          GIT_AUTHOR_EMAIL: "41898282+github-actions[bot]@users.noreply.github.com",
-          GIT_COMMITTER_NAME: "github-actions[bot]",
-          GIT_COMMITTER_EMAIL: "41898282+github-actions[bot]@users.noreply.github.com",
-        }
-      : { ALLOW_MAIN_COMMIT: "1" };
-
     const mergeAttempt = tryExec(
       "git",
       ["merge", "--no-edit", "-m", `chore(sync): merge upstream/main (${upstreamShort}) into main`, upstreamSha],
       worktreeDir,
-      mergeEnv,
+      { ALLOW_MAIN_COMMIT: "1" },
     );
 
     if (opts.dryRun) {
@@ -225,7 +228,7 @@ function main() {
         `## 自动上游同步预合并 (\`${upstreamShort}\`)`,
         "",
         `- **上游源提交**：[\`${upstreamShort}\`](https://github.com/BigPizzaV3/ClaudeMom/commit/${upstreamSha})`,
-        `- **合并状态**：✅ Git 自动合并无冲突`,
+        `- **合并状态**：✅ Git 自动合并无冲突（待验证后合入 \`main\`）`,
         "",
         "### 本次纳入的上游提交",
         "```text",
@@ -234,9 +237,12 @@ function main() {
         "",
         overlapSection,
         "",
-        "### 本机实测与合入门禁",
-        "确认检查通过后，在本机终端执行以下命令完成打包、Claude Desktop 真机实测并自动合入 `main`：",
+        "### 验证与合入方式",
         "```bash",
+        "# grokbot / Agent 自动验证并合入：",
+        "node scripts/verify-pr.mjs <PR编号> --auto",
+        "",
+        "# 或本机打包 .app 完成 Claude Desktop 真机实测后合入：",
         "node scripts/verify-pr.mjs <PR编号>",
         "```",
       ].join("\n");
@@ -248,32 +254,22 @@ function main() {
         tryExec("gh", ["pr", "ready", String(existingPr.number), "--repo", repo]);
         prNum = existingPr.number;
       } else {
-        const prUrl = capture("gh", ["pr", "create", "--repo", repo, "--base", "main", "--head", "sync/upstream-main", "--title", title, "--body-file", bodyFile]);
+        const prUrl = capture("gh", [
+          "pr",
+          "create",
+          "--repo",
+          repo,
+          "--base",
+          "main",
+          "--head",
+          "sync/upstream-main",
+          "--title",
+          title,
+          "--body-file",
+          bodyFile,
+        ]);
         prNum = Number(prUrl.split("/").pop());
       }
-
-      if (inActions) {
-        const statusArgs = [
-          "api",
-          "-X",
-          "POST",
-          `repos/${repo}/statuses/${prHeadSha}`,
-          "-f",
-          "state=pending",
-          "-f",
-          "context=ci-gate",
-          "-f",
-          "description=Running macOS CI and personal invariants check...",
-        ];
-        if (runUrl) statusArgs.push("-f", `target_url=${runUrl}`);
-        capture("gh", statusArgs);
-      }
-
-      writeGithubOutputs({
-        needs_ci: "true",
-        pr_head_sha: prHeadSha,
-        pr_number: String(prNum),
-      });
       console.log(`✓ 已创建/更新无冲突同步 PR #${prNum} (${prHeadSha.slice(0, 7)})`);
     } else {
       const conflictFiles = capture("git", ["diff", "--name-only", "--diff-filter=U"], worktreeDir)
@@ -299,7 +295,7 @@ function main() {
         "",
         overlapSection,
         "",
-        "### 🤖 可直接复制给任意 Coding Agent（Antigravity / Codex / Cursor / grokbot）的修复指令",
+        "### 🤖 Agent 冲突修复指令（grokbot / Antigravity / Codex / Cursor）",
         "```text",
         "请阅读仓库根目录 AGENTS.md，修复上游同步 PR 分支 sync/upstream-main 与 origin/main 的合并冲突：",
         "1. git fetch origin --prune && git switch -C sync/upstream-main origin/main",
@@ -316,32 +312,23 @@ function main() {
         tryExec("gh", ["pr", "ready", "--undo", String(existingPr.number), "--repo", repo]);
         prNum = existingPr.number;
       } else {
-        const prUrl = capture("gh", ["pr", "create", "--draft", "--repo", repo, "--base", "main", "--head", "sync/upstream-main", "--title", title, "--body-file", bodyFile]);
+        const prUrl = capture("gh", [
+          "pr",
+          "create",
+          "--draft",
+          "--repo",
+          repo,
+          "--base",
+          "main",
+          "--head",
+          "sync/upstream-main",
+          "--title",
+          title,
+          "--body-file",
+          bodyFile,
+        ]);
         prNum = Number(prUrl.split("/").pop());
       }
-
-      if (inActions) {
-        const statusArgs = [
-          "api",
-          "-X",
-          "POST",
-          `repos/${repo}/statuses/${upstreamSha}`,
-          "-f",
-          "state=failure",
-          "-f",
-          "context=ci-gate",
-          "-f",
-          "description=Merge conflict with main — resolve on sync/upstream-main",
-        ];
-        if (runUrl) statusArgs.push("-f", `target_url=${runUrl}`);
-        capture("gh", statusArgs);
-      }
-
-      writeGithubOutputs({
-        needs_ci: "false",
-        pr_head_sha: upstreamSha,
-        pr_number: String(prNum),
-      });
       console.log(`⚠️ 已创建/更新冲突草稿 PR #${prNum}`);
     }
   } finally {
