@@ -157,6 +157,7 @@ struct BackendRuntime {
     port: u16,
     instance_id: String,
     config_hash: String,
+    auto_recovered: bool,
 }
 
 fn runtime_slot() -> &'static Mutex<Option<BackendRuntime>> {
@@ -1433,7 +1434,6 @@ fn runtime_status() -> Option<(u16, String, String, Value)> {
         .unwrap_or_else(|error| error.into_inner());
     let runtime = slot.as_mut()?;
     if runtime.child.try_wait().ok().flatten().is_some() {
-        slot.take();
         return None;
     }
     let port = runtime.port;
@@ -1445,12 +1445,51 @@ fn runtime_status() -> Option<(u16, String, String, Value)> {
     (parse_ready(&health, &instance, pid) == Some(port)).then_some((port, instance, hash, health))
 }
 
+fn recover_exited_proxy(root: &Path, processes: &str) -> Result<()> {
+    let Ok(_guard) = OPERATION.try_lock() else {
+        return Ok(());
+    };
+    let mut slot = runtime_slot().lock().unwrap_or_else(|error| error.into_inner());
+    let Some(runtime) = slot.as_mut() else {
+        return Ok(());
+    };
+    // 健康探测超时不能证明进程已退出，避免中断正在生成的回复。
+    let Some(exit) = runtime.child.try_wait()? else {
+        return Ok(());
+    };
+    let port = runtime.port;
+    let previous_hash = runtime.config_hash.clone();
+    let auto_recovered = runtime.auto_recovered;
+    slot.take();
+    drop(slot);
+    host().diagnostic("claude_local.proxy_exited", json!({ "port": port, "exitCode": exit.code() }));
+    let config = host().load_config()?;
+    if auto_recovered
+        || resume_port(false, Some(port), processes, config.enabled).is_none()
+        || previous_hash != config_hash(&config)
+    {
+        return Ok(());
+    }
+    let node = node_runtime().context("未找到支持 fetch 和 WebSocket 的 Node.js")?;
+    let upstream = host().prepare_upstream(&config)?;
+    start_backend(root, &node, &config, &upstream, Some(port))?;
+    if let Some(runtime) = runtime_slot().lock().unwrap_or_else(|error| error.into_inner()).as_mut() {
+        runtime.auto_recovered = true;
+    }
+    host().diagnostic("claude_local.proxy_recovered", json!({ "port": port }));
+    Ok(())
+}
+
 pub fn status() -> Result<ClaudeLocalStatus> {
     let config = host().load_config()?;
     let root = root_dir();
     let source = source_app();
     let processes = claude_processes()?;
     let claude_running = !processes.is_empty();
+    let recovery_error = recover_exited_proxy(&root, &processes).err().map(|error| {
+        host().diagnostic("claude_local.proxy_recovery_failed", json!({ "message": format!("{error:#}") }));
+        format!("本地服务自动恢复失败：{error:#}")
+    });
     let runtime = runtime_status();
     // 完整功能模式直接用真实 profile，无 --user-data-dir；按代理端口识别本地进程。
     let port_hint = runtime
@@ -1469,15 +1508,16 @@ pub fn status() -> Result<ClaudeLocalStatus> {
     let previous_launch = fs::read(root.join("launch.json"))
         .ok()
         .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok());
+    let current_hash = config_hash(&config);
     let changed_since_launch = previous_launch
         .as_ref()
         .and_then(|value| value.get("configHash"))
         .and_then(Value::as_str)
-        .is_some_and(|hash| hash != config_hash(&config));
+        .is_some_and(|hash| hash != current_hash);
     let needs_restart = (config.enabled && claude_running && (!local_process || !running))
         || runtime
             .as_ref()
-            .is_some_and(|(_, _, hash, _)| hash != &config_hash(&config))
+            .is_some_and(|(_, _, hash, _)| hash != &current_hash)
         || (!config.enabled && local_process)
         || (claude_running && changed_since_launch);
     let preview = host().preview_upstream(&config);
@@ -1493,7 +1533,9 @@ pub fn status() -> Result<ClaudeLocalStatus> {
     let ready = ca_ready(&root);
     let trusted = ready && ca_trusted(&root);
     let dictation_ready = host().dictation_ready(&config);
-    let warning = if let Some(warning) = runtime
+    let warning = if recovery_error.is_some() {
+        recovery_error
+    } else if let Some(warning) = runtime
         .as_ref()
         .and_then(|(_, _, _, health)| health.get("warning"))
         .and_then(Value::as_str)
@@ -1642,7 +1684,10 @@ fn start_backend(
     }
     let instance = uuid::Uuid::new_v4().to_string();
     let ready_file = root.join("ready.json");
-    let log = private_file(&root.join("proxy.log"))?;
+    let log_path = root.join("proxy.log");
+    // 保留上一进程的退出现场，后续启动会截断当前日志。
+    let _ = fs::copy(&log_path, root.join("proxy.previous.log"));
+    let log = private_file(&log_path)?;
     let mut command = hidden_command(node);
     command
         .arg(root.join("proxy.mjs"))
@@ -1722,6 +1767,7 @@ fn start_backend(
                 port,
                 instance_id: instance,
                 config_hash: config_hash(config),
+                auto_recovered: false,
             });
             Ok(port)
         }
@@ -2335,6 +2381,90 @@ pub fn perform(action: &str) -> Result<ClaudeLocalResult> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    #[ignore = "requires an installed Claude Desktop and Node.js"]
+    fn exited_proxy_recovers_on_the_attached_port_only_with_unchanged_config() {
+        struct TestHost {
+            state: PathBuf,
+            config: Mutex<ClaudeLocalSettings>,
+            upstream: Upstream,
+        }
+        impl crate::Host for TestHost {
+            fn state_dir(&self) -> PathBuf { self.state.clone() }
+            fn ca_name(&self) -> &str { "ClaudeMom Test CA" }
+            fn load_config(&self) -> Result<ClaudeLocalSettings> { Ok(self.config.lock().unwrap().clone()) }
+            fn save_config(&self, config: &ClaudeLocalSettings) -> Result<()> {
+                *self.config.lock().unwrap() = config.clone();
+                Ok(())
+            }
+            fn preview_upstream(&self, _: &ClaudeLocalSettings) -> Result<Upstream> { Ok(self.upstream.clone()) }
+            fn prepare_upstream(&self, _: &ClaudeLocalSettings) -> Result<Upstream> { Ok(self.upstream.clone()) }
+            fn dictation_ready(&self, _: &ClaudeLocalSettings) -> bool { false }
+            fn prepare_dictation_service(&self) -> Result<()> { Ok(()) }
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let config = ClaudeLocalSettings { enabled: true, voice_input: false, ..Default::default() };
+        let upstream = Upstream {
+            root: "http://127.0.0.1:1".into(), default_model: "test-model".into(),
+            token: "test-token".into(), ..Default::default()
+        };
+        assert!(crate::install_host(std::sync::Arc::new(TestHost {
+            state: directory.path().to_path_buf(), config: Mutex::new(config.clone()), upstream: upstream.clone(),
+        })));
+        struct Cleanup;
+        impl Drop for Cleanup {
+            fn drop(&mut self) { stop_backend(); }
+        }
+        let _cleanup = Cleanup;
+        let root = root_dir();
+        install_assets(&root).unwrap();
+        prepare_ca(&root).unwrap();
+        let node = node_runtime().unwrap();
+        let port = start_backend(&root, &node, &config, &upstream, None).unwrap();
+        let attached = format!("1 /Applications/Claude.app/Contents/MacOS/Claude {}", proxy_flag(port));
+        let old_pid = runtime_slot().lock().unwrap().as_ref().unwrap().child.id();
+        recover_exited_proxy(&root, &attached).unwrap();
+        assert_eq!(runtime_slot().lock().unwrap().as_ref().unwrap().child.id(), old_pid);
+        {
+            let mut slot = runtime_slot().lock().unwrap();
+            let child = &mut slot.as_mut().unwrap().child;
+            child.kill().unwrap();
+            child.wait().unwrap();
+        }
+        let operation = OPERATION.lock().unwrap();
+        recover_exited_proxy(&root, &attached).unwrap();
+        assert!(runtime_status().is_none());
+        assert!(runtime_slot().lock().unwrap().is_some());
+        drop(operation);
+        let changed = ClaudeLocalSettings { localization: !config.localization, ..config.clone() };
+        host().save_config(&changed).unwrap();
+        recover_exited_proxy(&root, &attached).unwrap();
+        assert!(runtime_slot().lock().unwrap().is_none());
+        host().save_config(&config).unwrap();
+        start_backend(&root, &node, &config, &upstream, Some(port)).unwrap();
+        let old_pid = runtime_slot().lock().unwrap().as_ref().unwrap().child.id();
+        {
+            let mut slot = runtime_slot().lock().unwrap();
+            let child = &mut slot.as_mut().unwrap().child;
+            child.kill().unwrap();
+            child.wait().unwrap();
+        }
+        recover_exited_proxy(&root, &attached).unwrap();
+        let recovered = runtime_status().unwrap();
+        assert_eq!(recovered.0, port);
+        assert_ne!(runtime_slot().lock().unwrap().as_ref().unwrap().child.id(), old_pid);
+        assert!(root.join("proxy.previous.log").is_file());
+        {
+            let mut slot = runtime_slot().lock().unwrap();
+            let child = &mut slot.as_mut().unwrap().child;
+            child.kill().unwrap();
+            child.wait().unwrap();
+        }
+        recover_exited_proxy(&root, &attached).unwrap();
+        assert!(runtime_slot().lock().unwrap().is_none());
+    }
 
     #[test]
     fn upstream_web_proxy_prefers_inherited_then_system_and_only_http() {

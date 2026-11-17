@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import test from "node:test";
-import { claudeState, emptyProfile, formatWindow, hostOf, normalizeModels, profileProblem, setupSteps, type ClaudeStatus } from "./model.ts";
+import { claudeState, emptyProfile, formatWindow, hostOf, normalizeModels, profileProblem, restartMessage, setupSteps, type ClaudeStatus } from "./model.ts";
 
 const status = (patch: Partial<ClaudeStatus> = {}): ClaudeStatus => ({
   supported: true, sourceApp: "", version: "1.0", claudeRunning: false, running: false, connected: false,
@@ -38,6 +38,18 @@ test("启动前清单按顺序列出缺的步骤", () => {
   const ready = { ...emptyProfile(), baseUrl: "https://a.example", model: "m" };
   assert.deepEqual(setupSteps(status(), ready), []);
   assert.deepEqual(setupSteps(status({ caTrusted: false, nodeAvailable: false }), null).map((step) => step.id), ["upstream", "node", "trust"]);
+});
+
+test("配置变化、服务未响应和未连接显示各自原因", () => {
+  const attached = status({ claudeRunning: true, localProcess: true, running: true, needsRestart: true });
+  assert.equal(restartMessage(null), null);
+  assert.equal(restartMessage(status()), null);
+  assert.match(restartMessage(attached) ?? "", /连接配置已变更/);
+  const unavailable = { ...attached, running: false };
+  assert.match(restartMessage(unavailable) ?? "", /本地服务未响应/);
+  assert.equal(claudeState(unavailable, null).tone, "warn");
+  assert.equal(claudeState(attached, null).text, "运行中");
+  assert.match(restartMessage({ ...attached, localProcess: false }) ?? "", /尚未连接/);
 });
 
 test("窗口显示", () => {

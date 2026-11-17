@@ -136,10 +136,21 @@ export function claudeState(status: ClaudeStatus | null, busy: string | null): {
   if (!status) return { text: "正在检测 Claude…", tone: "busy" };
   if (!status.supported) return { text: "没有找到 Claude Desktop", tone: "warn" };
   if (status.connected) return { text: "已连接", tone: "ok" };
-  if (status.claudeRunning && status.localProcess) return { text: "运行中", tone: "ok" };
+  if (status.claudeRunning && status.localProcess) {
+    return status.running ? { text: "运行中", tone: "ok" } : { text: "本地服务未响应", tone: "warn" };
+  }
   if (status.claudeRunning) return { text: "Claude 已打开，但没有经 ClaudeMom 启动", tone: "warn" };
   if (status.running) return { text: "本地服务已就绪", tone: "ok" };
   return { text: "未启动", tone: "off" };
+}
+
+export function restartMessage(status: ClaudeStatus | null): string | null {
+  if (!status?.needsRestart) return null;
+  if (status.config.enabled && status.claudeRunning) {
+    if (!status.localProcess) return "Claude 尚未连接本地服务，请完全退出后从 ClaudeMom 启动。";
+    if (!status.running) return "本地服务未响应，请重新检测。若持续异常，请停止后重新启动 Claude。";
+  }
+  return "连接配置已变更，请完全退出 Claude 后重新启动生效。";
 }
 
 /** 启动前还差什么：按顺序列出，界面逐条给按钮。 */
