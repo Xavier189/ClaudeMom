@@ -122,6 +122,20 @@ export const PERSONAL_INVARIANTS = [
     fix: "检查 crates/claude-local/runtime/proxy.mjs 在响应关闭及 shutdown() 时的连接销毁逻辑。",
   },
   {
+    id: "INV-CUSTOM-07",
+    title: "1P 模板本地能力权限解锁与 v6 桌面浏览器/CU 门控",
+    file: "crates/claude-local/runtime/proxy.mjs",
+    mustContain: ["normalizeCurrentUserAccess(", '"17519066"', '"4293378213"'],
+    fix: "检查 crates/claude-local/runtime/proxy.mjs 与 runtime.mjs 的 normalizeCurrentUserAccess 及 /api/desktop/features。",
+  },
+  {
+    id: "INV-CUSTOM-07B",
+    title: "3P 模式开启内置浏览器、desktopHome 与模型行为映射",
+    file: "crates/claude-local/src/backend.rs",
+    mustContain: ['"builtinBrowserEnabled": true', '"desktopHome":', "fn inferred_behaves_as"],
+    fix: "检查 crates/claude-local/src/backend.rs 的 gateway_config_entry。",
+  },
+  {
     id: "INV-FORK-01",
     title: "发版脚本具备个人 Fork 防误触保护",
     file: "scripts/release.mjs",

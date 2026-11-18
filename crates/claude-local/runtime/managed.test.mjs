@@ -15,7 +15,7 @@ import { fileURLToPath } from "node:url";
 import { after, before, test } from "node:test";
 import { decode, get, asMsg, asStr, ld, vi } from "./rpc.mjs";
 import { createOfficialAssets } from "./official-assets.mjs";
-import { createGatewayStreamParser, createStateStore, dropUnroutedModels, gatewayHttpError, isPrivateFile, gatewayModel, gatewayTarget, mergePoolModels, modelLabel, modelSelectors, modelWindow, planProfile, runtimeConfig } from "./runtime.mjs";
+import { createGatewayStreamParser, createStateStore, dropUnroutedModels, gatewayHttpError, isPrivateFile, gatewayModel, gatewayTarget, mergePoolModels, modelLabel, modelSelectors, modelWindow, normalizeCurrentUserAccess, planProfile, runtimeConfig } from "./runtime.mjs";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const testCaDir = process.env.CLAUDE_LOCAL_TEST_CA_DIR || path.join(here, "ca");
@@ -1577,4 +1577,66 @@ test("model selectors use friendly names and fall back to ids", () => {
   const raw = models.find((model) => model.id === "other/raw-model");
   assert.equal(raw.name, "other/raw-model");
   assert.equal(raw.description, "");
+});
+
+test("free-tier recorded templates unlock local user access features and v6 desktop gates", async () => {
+  const runtimeDir = path.join(root, "v6-access-runtime");
+  fs.cpSync(path.join(root, "runtime"), runtimeDir, { recursive: true });
+  const mock = path.join(runtimeDir, "mock");
+  fs.rmSync(mock, { recursive: true, force: true });
+  fs.mkdirSync(mock, { recursive: true });
+  fs.writeFileSync(path.join(mock, ".codex-plus-template"), "");
+  fs.cpSync(path.join(here, "mock-templates", "a4ced7f85b"), path.join(mock, "a4ced7f85b"), { recursive: true });
+
+  const statusOf = (features, key) => features.find((entry) => entry.feature === key)?.status;
+
+  const defaultInstance = await start({
+    CLAUDE_LOCAL_CACHE_DIR: path.join(runtimeDir, ".cache"),
+    CLAUDE_LOCAL_COWORK: "1",
+    CLAUDE_LOCAL_COMPUTER_USE: "1",
+  }, runtimeDir);
+  try {
+    const bootstrap = (await request(defaultInstance, "/edge-api/bootstrap", { host: "claude.ai" })).json;
+    const access = (await request(defaultInstance, "/api/bootstrap/local/current_user_access", { host: "claude.ai" })).json;
+    for (const features of [bootstrap.current_user_access.features, access.features]) {
+      for (const localFeature of ["cowork", "cowork_browser_pane", "browser_data_import", "cowork_watch_record", "work_across_apps", "omelette", "computer_use"]) {
+        assert.equal(statusOf(features, localFeature), "available", localFeature);
+      }
+      for (const cloudOnly of ["claude_code_fast_mode", "claude_code_remote_control", "cowork_remote_control", "claude_code_routines", "claude_code_security"]) {
+        assert.equal(statusOf(features, cloudOnly), "blocked_by_org_tier", cloudOnly);
+      }
+    }
+    const desktop = (await request(defaultInstance, "/api/desktop/features", { host: "claude.ai" })).json.features;
+    for (const id of ["17519066", "3990395613", "2464731750", "4293378213", "2486083521", "36693946"]) {
+      assert.equal(desktop[id].on, true, id);
+      assert.equal(desktop[id].value, true, id);
+    }
+  } finally {
+    await stop(defaultInstance);
+  }
+
+  const disabledInstance = await start({
+    CLAUDE_LOCAL_CACHE_DIR: path.join(runtimeDir, ".cache"),
+    CLAUDE_LOCAL_COWORK: "0",
+    CLAUDE_LOCAL_COMPUTER_USE: "0",
+  }, runtimeDir);
+  try {
+    const bootstrap = (await request(disabledInstance, "/edge-api/bootstrap", { host: "claude.ai" })).json;
+    const features = bootstrap.current_user_access.features;
+    assert.equal(statusOf(features, "cowork"), "blocked_by_org_tier");
+    assert.equal(statusOf(features, "cowork_browser_pane"), "blocked_by_org_tier");
+    assert.equal(statusOf(features, "computer_use"), "blocked_by_org_tier");
+    assert.equal(statusOf(features, "work_across_apps"), "available");
+    assert.equal(bootstrap.account.capabilities.includes("cowork"), false);
+    const desktop = (await request(disabledInstance, "/api/desktop/features", { host: "claude.ai" })).json.features;
+    for (const id of ["17519066", "3990395613", "2464731750", "4293378213", "2486083521", "36693946"]) {
+      assert.equal(desktop[id].on, false, id);
+      assert.equal(desktop[id].value, false, id);
+    }
+  } finally {
+    await stop(disabledInstance);
+  }
+
+  // 无模板的合成空表不会被凭空注入条目
+  assert.deepEqual(normalizeCurrentUserAccess({ features: [] }, runtimeConfig({})).features, []);
 });

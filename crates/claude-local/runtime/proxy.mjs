@@ -27,7 +27,7 @@ import zlib from "node:zlib";
 import { fileURLToPath } from "node:url";
 import { createConversationService } from "./conversation-service.mjs";
 import { isPatchedStartupAsset, startupAssets } from "./scripts/patch-dictation-start.mjs";
-import { createGatewayStreamParser, createStateStore, gatewayBody, gatewayHttpError, gatewayModel, gatewayTarget, isPrivateFile, mergePoolModels, modelList, modelSelectors, modelWindow, planProfile, runtimeConfig } from "./runtime.mjs";
+import { createGatewayStreamParser, createStateStore, gatewayBody, gatewayHttpError, gatewayModel, gatewayTarget, isPrivateFile, mergePoolModels, modelList, modelSelectors, modelWindow, normalizeCurrentUserAccess, planProfile, runtimeConfig } from "./runtime.mjs";
 import { createOfficialAssets } from "./official-assets.mjs";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -286,9 +286,14 @@ const BOOTSTRAP = {
 };
 BOOTSTRAP.feature_flags.computer_use = runtime.computerUse;
 BOOTSTRAP.feature_flags.computer_use_rollout = runtime.computerUse;
+BOOTSTRAP.feature_flags.cowork = runtime.cowork;
 if (!runtime.computerUse) {
   ACCOUNT.capabilities = ACCOUNT.capabilities.filter((name) => name !== "computer_use");
   ORG.capabilities = ORG.capabilities.filter((name) => name !== "computer_use");
+}
+if (!runtime.cowork) {
+  ACCOUNT.capabilities = ACCOUNT.capabilities.filter((name) => name !== "cowork");
+  ORG.capabilities = ORG.capabilities.filter((name) => name !== "cowork");
 }
 
 // 读取录制到的真实 bootstrap 作为模板（capture.mjs 产出）
@@ -780,6 +785,7 @@ function resolvedBootstrap() {
   result.personalized_greeting = withDisplayName(result.personalized_greeting);
   if (runtime.cowork) forceCowork(result, template);
   enableLocalThemeRenderer(result);
+  result.current_user_access = normalizeCurrentUserAccess(result.current_user_access, runtime);
   if (!runtime.hubHome) useClassicHome(result, template);
   if (useOfficialShell) {
     // 模板里的 gated_imports 是录制时线上版本的分块清单，与本机外壳对不上：换成本机版本。
@@ -1040,28 +1046,37 @@ function mockApi(req, res, url) {
   if (method === "GET" && /^\/api\/organizations\/[^/]+\/kyc_status$/.test(p)) {
     return json(res, { status: "not_required", should_poll: false });
   }
+function forcedDesktopFeature(value) {
+  const on = Boolean(value);
+  return { value, on, off: !on, source: "force", experiment: null, experimentResult: null };
+}
+
   // 原生桌面使用已求值的 GrowthBook 结果；用户开关和系统权限仍由客户端检查。
   if (method === "GET" && p === "/api/desktop/features") {
     const features = {
-      "1291166712": {
-        value: { enabled: runtime.computerUse, appScopedEnabled: runtime.computerUse && runtime.backgroundMode },
-        on: runtime.computerUse, off: !runtime.computerUse, source: "force",
-        experiment: null, experimentResult: null,
-      },
+      "1291166712": forcedDesktopFeature({
+        enabled: runtime.computerUse,
+        appScopedEnabled: runtime.computerUse && runtime.backgroundMode,
+      }),
       // Windows 上计算机使用的另一道门：Claude 里是 `process.platform==="win32"&&!X("40173473")` 就不给开，
       // 设置页显示「您的账户尚未启用计算机使用功能」。macOS 不读它。
-      "40173473": {
-        value: runtime.computerUse, on: runtime.computerUse, off: !runtime.computerUse, source: "force",
-        experiment: null, experimentResult: null,
-      },
+      "40173473": forcedDesktopFeature(runtime.computerUse),
     };
+    features["1291166712"].on = runtime.computerUse;
+    features["1291166712"].off = !runtime.computerUse;
+    if (runtime.managed) {
+      // Claude Desktop v6.6395.0 内置浏览器 / Cowork 浏览器面板与 Bridge Computer Use 桌面门控。
+      for (const id of ["17519066", "3990395613", "2464731750"]) {
+        features[id] = forcedDesktopFeature(runtime.cowork);
+      }
+      for (const id of ["4293378213", "2486083521", "36693946"]) {
+        features[id] = forcedDesktopFeature(runtime.computerUse);
+      }
+    }
     // 后台模式的 macOS 版本上限（Claude 内置默认 26.x，系统更新就提示「暂不支持」）。
     // 强制开启时把上限抬到 99，新系统也放行。
     if (runtime.forceBackgroundMode) {
-      features["1346958739"] = {
-        value: { major: 99, minor: 9999 }, on: true, off: false, source: "force",
-        experiment: null, experimentResult: null,
-      };
+      features["1346958739"] = forcedDesktopFeature({ major: 99, minor: 9999 });
     }
     return json(res, { features });
   }
@@ -1250,6 +1265,7 @@ function mockApi(req, res, url) {
     if (!dataManaged) {
       try { base = JSON.parse(fs.readFileSync(path.join(POC_MOCK, "bootstrap.json"), "utf8")).current_user_access ?? base; } catch {}
     }
+    base = normalizeCurrentUserAccess(base, runtime);
     return jsonWithActiveOrg(res, {
       ...base,
       has_access: true,

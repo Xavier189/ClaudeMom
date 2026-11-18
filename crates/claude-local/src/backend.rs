@@ -398,9 +398,57 @@ const CONFIG_LIBRARY_BACKUP: &str = "configLibrary.codex-plus-backup";
 const GATEWAY_CONFIG_ID: &str = "00000000-0000-4000-8000-636c6175646d";
 const GATEWAY_CONFIG_MARKER: &str = "claudeMomGateway";
 
+fn model_window_tokens(upstream: &Upstream, model: &str) -> Option<u64> {
+    if let Some(&window) = upstream.model_windows.get(model) {
+        return (window > 0).then_some(window);
+    }
+    let lowered = model.to_ascii_lowercase();
+    if let Some((_, &window)) = upstream
+        .model_windows
+        .iter()
+        .find(|(key, _)| key.to_ascii_lowercase() == lowered)
+    {
+        return (window > 0).then_some(window);
+    }
+    let bare = |name: &str| name.rsplit('/').next().unwrap_or(name).to_ascii_lowercase();
+    let target_bare = bare(model);
+    if !target_bare.is_empty()
+        && let Some((_, &window)) = upstream
+            .model_windows
+            .iter()
+            .find(|(key, _)| bare(key) == target_bare)
+    {
+        return (window > 0).then_some(window);
+    }
+    (model == upstream.default_model.trim())
+        .then_some(upstream.default_window)
+        .flatten()
+        .filter(|window| *window > 0)
+}
+
+fn inferred_behaves_as(model: &str) -> Option<&'static str> {
+    let bare = model.rsplit('/').next().unwrap_or(model).trim().to_ascii_lowercase();
+    if !model.contains('/')
+        && (bare.starts_with("claude-opus-")
+            || bare.starts_with("claude-sonnet-")
+            || bare.starts_with("claude-haiku-")
+            || bare.starts_with("claude-fable-")
+            || bare.starts_with("claude-3-"))
+    {
+        return None;
+    }
+    if bare.contains("opus") || bare.contains("fable") {
+        Some("claude-opus-4-6")
+    } else if bare.contains("haiku") {
+        Some("claude-haiku-4-5")
+    } else {
+        Some("claude-sonnet-4-6")
+    }
+}
+
 /// Claude 第三方模式的推理配置：推理走本地服务（它按上游 Key 校验，带上两种认证头、
-/// 换算模型名、去掉 diagnostics 再转给上游），模型列表照上游的来，带显示名。
-fn gateway_config_entry(port: u16, upstream: &Upstream) -> Value {
+/// 换算模型名、去掉 diagnostics 再转给上游），模型列表照上游的来，带显示名、1M 窗口与行为映射。
+fn gateway_config_entry(port: u16, upstream: &Upstream, cowork: bool) -> Value {
     let mut names: Vec<&str> = Vec::new();
     for model in std::iter::once(&upstream.default_model).chain(upstream.models.iter()) {
         let model = model.trim();
@@ -411,16 +459,29 @@ fn gateway_config_entry(port: u16, upstream: &Upstream) -> Value {
     let models: Vec<Value> = names
         .into_iter()
         .map(|model| {
-            match upstream
+            let label = upstream
                 .model_names
                 .get(model)
                 .and_then(|value| value["name"].as_str())
                 .map(str::trim)
-                .filter(|label| !label.is_empty() && *label != model)
-            {
-                Some(label) => json!({ "name": model, "labelOverride": label }),
-                None => json!(model),
+                .filter(|label| !label.is_empty() && *label != model);
+            let supports_1m = model_window_tokens(upstream, model).is_some_and(|w| w >= 1_000_000);
+            let behaves_as = inferred_behaves_as(model);
+            if label.is_none() && !supports_1m && behaves_as.is_none() {
+                return json!(model);
             }
+            let mut obj = serde_json::Map::new();
+            obj.insert("name".into(), json!(model));
+            if let Some(label) = label {
+                obj.insert("labelOverride".into(), json!(label));
+            }
+            if supports_1m {
+                obj.insert("supports1m".into(), json!(true));
+            }
+            if let Some(behaves_as) = behaves_as {
+                obj.insert("behavesAs".into(), json!(behaves_as));
+            }
+            Value::Object(obj)
         })
         .collect();
     json!({
@@ -431,6 +492,8 @@ fn gateway_config_entry(port: u16, upstream: &Upstream) -> Value {
         "inferenceModels": models,
         "modelDiscoveryEnabled": false,
         "disableDeploymentModeChooser": true,
+        "builtinBrowserEnabled": true,
+        "desktopHome": if cowork { "standard" } else { "simple" },
     })
 }
 
@@ -2285,7 +2348,7 @@ fn launch_original(
             // （就是本地服务），不经代理、也不需要模拟账号。只换 deploymentMode 和 configLibrary。
             let sets = profile_sets();
             apply_real_profile(&sets, root, "3p")?;
-            write_gateway_library(&sets, &gateway_config_entry(port, upstream))?;
+            write_gateway_library(&sets, &gateway_config_entry(port, upstream, cowork))?;
             command.arg(gateway_flag(port));
             if localization {
                 command.arg("--lang=zh-CN");
@@ -3210,10 +3273,10 @@ server.listen(0,'127.0.0.1',()=>{
         };
 
         apply_real_profile(&sets, &state, "3p").unwrap();
-        write_gateway_library(&sets, &gateway_config_entry(54321, &upstream)).unwrap();
+        write_gateway_library(&sets, &gateway_config_entry(54321, &upstream, true)).unwrap();
         // 同一模式再来一次（换了端口）：不报错，配置跟着更新。
         apply_real_profile(&sets, &state, "3p").unwrap();
-        write_gateway_library(&sets, &gateway_config_entry(54322, &upstream)).unwrap();
+        write_gateway_library(&sets, &gateway_config_entry(54322, &upstream, true)).unwrap();
 
         assert_eq!(read_json(&support.join("Claude/claude_desktop_config.json"))["deploymentMode"], json!("3p"));
         let library = support.join("Claude-3p/configLibrary");
@@ -3224,7 +3287,15 @@ server.listen(0,'127.0.0.1',()=>{
         assert_eq!(entry["inferenceProvider"], json!("gateway"));
         assert_eq!(entry["inferenceGatewayBaseUrl"], json!("http://127.0.0.1:54322"));
         assert_eq!(entry["inferenceGatewayApiKey"], json!("sk-test"));
-        assert_eq!(entry["inferenceModels"], json!(["relay/opus", { "name": "relay/flash", "labelOverride": "Flash" }]));
+        assert_eq!(entry["builtinBrowserEnabled"], json!(true));
+        assert_eq!(entry["desktopHome"], json!("standard"));
+        assert_eq!(
+            entry["inferenceModels"],
+            json!([
+                { "name": "relay/opus", "behavesAs": "claude-opus-4-6" },
+                { "name": "relay/flash", "labelOverride": "Flash", "behavesAs": "claude-sonnet-4-6" },
+            ])
+        );
         assert_eq!(read_json(&support.join("Claude-3p").join(CONFIG_LIBRARY_BACKUP).join("_meta.json"))["appliedId"], json!("user"));
         #[cfg(unix)]
         {
@@ -3255,7 +3326,7 @@ server.listen(0,'127.0.0.1',()=>{
         apply_real_profile_one_p(&sets, &state).unwrap();
         assert_eq!(read_json(&state.join(SWITCH_STATE_FILE))["mode"], json!("1p"));
         apply_real_profile(&sets, &state, "3p").unwrap();
-        write_gateway_library(&sets, &gateway_config_entry(1, &upstream)).unwrap();
+        write_gateway_library(&sets, &gateway_config_entry(1, &upstream, true)).unwrap();
         let switched = read_json(&state.join(SWITCH_STATE_FILE));
         assert_eq!(switched["mode"], json!("3p"));
         // 记下的是用户最初的值，不是中间那次 1p。
@@ -3267,6 +3338,55 @@ server.listen(0,'127.0.0.1',()=>{
         assert_eq!(read_json(&support.join("Claude/claude_desktop_config.json"))["deploymentMode"], json!("1p"));
         restore_real_profile(&sets, &state).unwrap();
         assert_eq!(read_json(&support.join("Claude/claude_desktop_config.json"))["deploymentMode"], json!("3p"));
+    }
+
+    #[test]
+    fn gateway_config_entry_sets_1m_behaves_as_browser_and_desktop_home() {
+        let upstream = Upstream {
+            root: "https://relay.example".into(),
+            token: "sk-test".into(),
+            default_model: "claude-opus-4-6".into(),
+            models: vec![
+                "claude-opus-4-6".into(),
+                "claude-sonnet-4-6".into(),
+                "agentrouter/gpt-6.1-sol".into(),
+                "relay/haiku-fast".into(),
+            ],
+            model_names: [
+                ("agentrouter/gpt-6.1-sol".to_string(), json!({ "name": "GPT-6.1 Sol" })),
+            ]
+            .into_iter()
+            .collect(),
+            model_windows: [
+                ("claude-sonnet-4-6".to_string(), 1_000_000),
+                ("gpt-6.1-sol".to_string(), 1_000_000),
+            ]
+            .into_iter()
+            .collect(),
+            default_window: Some(200_000),
+            ..Upstream::default()
+        };
+
+        let cowork_on = gateway_config_entry(54321, &upstream, true);
+        assert_eq!(cowork_on["builtinBrowserEnabled"], json!(true));
+        assert_eq!(cowork_on["desktopHome"], json!("standard"));
+        assert_eq!(
+            cowork_on["inferenceModels"],
+            json!([
+                "claude-opus-4-6",
+                { "name": "claude-sonnet-4-6", "supports1m": true },
+                {
+                    "name": "agentrouter/gpt-6.1-sol",
+                    "labelOverride": "GPT-6.1 Sol",
+                    "supports1m": true,
+                    "behavesAs": "claude-sonnet-4-6",
+                },
+                { "name": "relay/haiku-fast", "behavesAs": "claude-haiku-4-5" },
+            ])
+        );
+
+        let cowork_off = gateway_config_entry(54321, &upstream, false);
+        assert_eq!(cowork_off["desktopHome"], json!("simple"));
     }
 
     #[test]
