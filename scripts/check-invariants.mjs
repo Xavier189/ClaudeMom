@@ -148,6 +148,8 @@ const GOVERNANCE_FILES = [
   "AGENTS.md",
   "CLAUDE.md",
   ".githooks/pre-commit",
+  "scripts/macos-install.mjs",
+  "scripts/release-mac.mjs",
   "scripts/sync-upstream.mjs",
   "scripts/verify-pr.mjs",
 ];

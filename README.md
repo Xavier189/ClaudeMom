@@ -13,7 +13,7 @@ ClaudeMom 是一种**新的接入方式**：在本机把你的 API Key **变成�
 
 不需要 Claude 账号，不改原版应用，不动官方登录态，官方 App 照常更新。
 
-下载：[Releases](https://github.com/BigPizzaV3/ClaudeMom/releases/latest)（macOS 通用版 dmg / Windows exe）
+下载：[个人 Fork macOS Releases](https://github.com/Xavier189/ClaudeMom/releases/latest)（个人定制 macOS `.dmg` / `.app.zip`，不含 Windows；原作者双平台：[BigPizzaV3/ClaudeMom](https://github.com/BigPizzaV3/ClaudeMom/releases/latest)）
 
 友情链接：<a href="https://linux.do">LINUX DO</a>
 
@@ -82,7 +82,7 @@ node scripts/relaunch-local.mjs    # 构建并重启本地实例（在仓库根�
 
 | 项目 | 约定 | 说明 |
 | --- | --- | --- |
-| `origin` | `Xavier189/ClaudeMom` | 个人 Fork，托管个人黄金主线 `main`、上游镜像 `upstream-main` 与 `local/verified-*` 标签 |
+| `origin` | `Xavier189/ClaudeMom` | 个人 Fork，托管个人黄金主线 `main`、上游镜像 `upstream-main` 与仅含 macOS 产物的 `mac-v*` Releases |
 | `upstream` | `BigPizzaV3/ClaudeMom` | 作者上游仓库，只拉取更新并禁用推送（`pushurl = no_push`） |
 | `main` | **个人长期黄金主线** | 默认分支，禁止直推；所有变更须经 PR 验证通过后以 Merge Commit 合入 |
 | `upstream-main` | **上游干净镜像** | 仅通过 `--ff-only` 同步 `BigPizzaV3/ClaudeMom:main`，不提交任何定制改动 |
@@ -93,8 +93,11 @@ node scripts/relaunch-local.mjs    # 构建并重启本地实例（在仓库根�
 2. **多 Agent 协同开发**：所有 Coding Agent 统一遵循 [AGENTS.md](AGENTS.md)（`CLAUDE.md` 同源软链），从 `main` 切分支提 PR，由 [check-invariants.mjs](scripts/check-invariants.mjs) 自动守护提交脱敏身份与个人定制不变量。
 3. **PR 拉取验证与合入**：
    - **自动化验证合并（grokbot / Agent）**：运行 `node scripts/verify-pr.mjs <PR编号> --auto` 在隔离 `git worktree` 预合并跑完全套不变量与测试，通过自动 Merge，失败自动转草稿并留言报错；
-   - **本机真机实测安装**：运行 `node scripts/verify-pr.mjs <PR编号>` 打包 `.app` 并拉起 Claude Desktop 完成真机交互实测，输入 `pass` 后自动备份替换应用、Merge PR 并推送 `local/verified-*` 标签。
-4. **禁止操作**：不点击应用内更新（仍指向上游 Release），不运行 [release.mjs](scripts/release.mjs)，不向个人 Fork 推送 `v*` 标签。
+   - **本机真机实测安装**：运行 `node scripts/verify-pr.mjs <PR编号>` 打包 `.app` 并拉起 Claude Desktop 完成真机交互实测，输入 `pass` 后自动归档旧应用、安装新包、清理重复构建包并 Merge PR（如需推送 `local/verified-*` 标签可加 `--tag`）。
+4. **本地打包与个人 Mac Release**：
+   - 运行 `node scripts/build-local.mjs --install` 验证、安装 `/Applications/ClaudeMom.app` 并自动清理 `target/` 重复 `.app`；
+   - 运行 `node scripts/release-mac.mjs` 从已合入 `main` 构建 `.dmg` / `.app.zip` / `SHA256SUMS.txt` 并发布至 `Xavier189/ClaudeMom` Releases（仅 macOS，忽略 Windows）。
+5. **禁止操作**：不点击应用内更新（仍指向上游 Release），不运行 [release.mjs](scripts/release.mjs)，不向个人 Fork 推送 `v*` 标签。
 
 完整命令、远端初始化、冲突修复与回滚步骤见 [个人 Fork 维护与本地打包指南](docs/local-maintenance.md) 与 [AGENTS.md](AGENTS.md)。
 

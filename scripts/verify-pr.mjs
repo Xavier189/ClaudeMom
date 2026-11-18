@@ -10,14 +10,20 @@
  *      node scripts/verify-pr.mjs <PR编号> --check-only
  *
  *   3. 本机 macOS 打包 .app + Claude Desktop 交互式真机实测签收合入（默认模式）：
- *      node scripts/verify-pr.mjs <PR编号> [--no-install]
+ *      node scripts/verify-pr.mjs <PR编号> [--no-install] [--tag]
  */
-import { execFileSync, spawn } from "node:child_process";
+import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import readline from "node:readline/promises";
 import { fileURLToPath } from "node:url";
+import {
+  backupAndInstallApp,
+  launchCleanApp,
+  stampNow,
+  stopBundleProcess,
+} from "./macos-install.mjs";
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
@@ -41,6 +47,8 @@ export function parseVerifyArgs(argv) {
       flags.add("checkOnly");
     } else if (arg === "--no-install") {
       flags.add("noInstall");
+    } else if (arg === "--tag") {
+      flags.add("tag");
     } else if (/^#?\d+$/.test(arg) && prNumber === null) {
       prNumber = Number(arg.replace(/^#/, ""));
     } else {
@@ -56,6 +64,7 @@ export function parseVerifyArgs(argv) {
     auto: flags.has("auto"),
     checkOnly: flags.has("checkOnly"),
     noInstall: flags.has("noInstall"),
+    pushTag: flags.has("tag"),
   };
 }
 
@@ -80,12 +89,6 @@ function tryCapture(cmd, args, cwd = REPO_ROOT, extraEnv = {}) {
 function runInherit(cmd, args, cwd = REPO_ROOT, extraEnv = {}) {
   console.log(`$ ${cmd} ${args.join(" ")}`);
   execFileSync(cmd, args, { cwd, env: { ...process.env, ...extraEnv }, stdio: "inherit" });
-}
-
-function stampNow() {
-  const d = new Date();
-  const pad = (n) => String(n).padStart(2, "0");
-  return `${d.getFullYear()}${pad(d.getMonth() + 1)}${pad(d.getDate())}-${pad(d.getHours())}${pad(d.getMinutes())}${pad(d.getSeconds())}`;
 }
 
 function getRepoSlug() {
@@ -125,64 +128,15 @@ function reportFailureToPr(repo, pr, stamp, stageTitle, detail) {
   tryCapture("gh", ["pr", "comment", String(pr.number), "--repo", repo, "--body", body]);
 }
 
-function launchCleanApp(bundlePath) {
-  const cleanEnv = Object.fromEntries(
-    Object.entries(process.env).filter(([name]) => !/^(CLAUDE_CODE_|CLAUDECODE$|ANTHROPIC_|(HTTPS?|ALL|NO)_PROXY$)/i.test(name)),
-  );
-  spawn("open", ["-n", bundlePath], { detached: true, stdio: "ignore", env: cleanEnv }).unref();
-}
-
-function stopBundleProcess(bundlePath) {
-  try {
-    execFileSync("pkill", ["-f", `${bundlePath}/Contents/MacOS/claude-mom`], { stdio: "ignore" });
-    execFileSync("sleep", ["1"]);
-  } catch {
-    // not running
-  }
-}
-
-function backupAndInstallApp(stagedBundle, prNumber, stamp) {
-  const targetApp = "/Applications/ClaudeMom.app";
-  const backupsDir = path.join(os.homedir(), ".claude-mom", "backups");
-  const snapshotsDir = path.join(os.homedir(), ".claude-mom-snapshots");
-  fs.mkdirSync(backupsDir, { recursive: true });
-  fs.mkdirSync(snapshotsDir, { recursive: true, mode: 0o700 });
-  fs.chmodSync(snapshotsDir, 0o700);
-
-  runInherit("/usr/bin/codesign", ["--verify", "--deep", "--strict", stagedBundle]);
-
-  const stateDir = path.join(os.homedir(), ".claude-mom");
-  const stateBackup = path.join(snapshotsDir, `pr${prNumber}-${stamp}`);
-  if (fs.existsSync(stateDir)) {
-    execFileSync("ditto", [stateDir, stateBackup]);
-  }
-
-  const appBackup = path.join(backupsDir, `ClaudeMom-before-pr${prNumber}-${stamp}.app`);
-  const tempStage = fs.mkdtempSync("/Applications/.claudemom-verify-stage.");
-  const tempApp = path.join(tempStage, "ClaudeMom.app");
-  try {
-    execFileSync("ditto", [stagedBundle, tempApp]);
-    runInherit("/usr/bin/codesign", ["--verify", "--deep", "--strict", tempApp]);
-    if (fs.existsSync(targetApp)) {
-      fs.renameSync(targetApp, appBackup);
-      console.log(`• 已备份旧版应用至：${appBackup}`);
-    }
-    fs.renameSync(tempApp, targetApp);
-    console.log(`✓ 已替换安装：${targetApp}`);
-  } finally {
-    fs.rmSync(tempStage, { recursive: true, force: true });
-  }
-}
-
 async function main() {
   const opts = parseVerifyArgs(process.argv.slice(2));
   if (opts.help || !opts.prNumber) {
     console.log(
       [
         "用法：",
-        "  node scripts/verify-pr.mjs <PR编号> --auto          # grokbot / Agent 无人值守预合并验证 + 通过后自动合入 main",
-        "  node scripts/verify-pr.mjs <PR编号> --check-only    # 仅预合并验证全套检查，不执行合并",
-        "  node scripts/verify-pr.mjs <PR编号> [--no-install]  # 本机打包 .app + Claude Desktop 真机交互实测后合入 main",
+        "  node scripts/verify-pr.mjs <PR编号> --auto                  # grokbot / Agent 无人值守预合并验证 + 通过后自动合入 main",
+        "  node scripts/verify-pr.mjs <PR编号> --check-only            # 仅预合并验证全套检查，不执行合并",
+        "  node scripts/verify-pr.mjs <PR编号> [--no-install] [--tag]  # 本机打包 .app + Claude Desktop 真机实测后合入 main",
       ].join("\n"),
     );
     process.exit(opts.help ? 0 : 1);
@@ -226,11 +180,11 @@ async function main() {
 
     try {
       runInherit(process.execPath, ["scripts/check-invariants.mjs"], worktreeDir);
-      runInherit(
-        process.execPath,
-        ["--test", "scripts/check-invariants.test.mjs", "scripts/verify-pr.test.mjs", "scripts/sync-upstream.test.mjs"],
-        worktreeDir,
-      );
+      const scriptTests = fs
+        .readdirSync(path.join(worktreeDir, "scripts"))
+        .filter((file) => file.endsWith(".test.mjs"))
+        .map((file) => path.join("scripts", file));
+      runInherit(process.execPath, ["--test", ...scriptTests], worktreeDir);
       if (opts.auto || opts.checkOnly) {
         runInherit(process.execPath, ["scripts/build-local.mjs", "--check-only"], worktreeDir);
       } else {
@@ -280,7 +234,12 @@ async function main() {
         }
 
         if (!opts.noInstall) {
-          backupAndInstallApp(stagedBundle, pr.number, stamp);
+          backupAndInstallApp(stagedBundle, {
+            backupPrefix: `pr${pr.number}`,
+            stamp,
+            stateBackupName: `pr${pr.number}-${stamp}`,
+            cleanupStagedBundle: true,
+          });
           launchCleanApp("/Applications/ClaudeMom.app");
         }
       } finally {
@@ -300,7 +259,7 @@ async function main() {
       runInherit("git", ["merge", "--ff-only", "origin/main"]);
     }
 
-    if (!opts.auto) {
+    if (!opts.auto && opts.pushTag) {
       const verifiedTag = `local/verified-${stamp}`;
       runInherit("git", ["tag", verifiedTag, "origin/main"]);
       runInherit("git", ["push", "origin", `refs/tags/${verifiedTag}`]);

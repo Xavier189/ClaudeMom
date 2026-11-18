@@ -9,13 +9,15 @@ test("parseVerifyArgs parses PR numbers and modes strictly", () => {
     auto: true,
     checkOnly: false,
     noInstall: false,
+    pushTag: false,
   });
-  assert.deepEqual(parseVerifyArgs(["15", "--check-only"]), {
+  assert.deepEqual(parseVerifyArgs(["15", "--check-only", "--tag"]), {
     prNumber: 15,
     help: false,
     auto: false,
     checkOnly: true,
     noInstall: false,
+    pushTag: true,
   });
   assert.throws(() => parseVerifyArgs(["12", "--auto", "--check-only"]), /不能同时指定/);
   assert.throws(() => parseVerifyArgs(["12", "--bogus"]), /未知参数/);
