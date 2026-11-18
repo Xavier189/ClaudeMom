@@ -42,7 +42,7 @@ pub fn import_cli_sessions(code_dir: &Path, sessions_dir: &Path) -> Result<Impor
             .collect();
         for name in &names {
             let Some(id) = name.strip_suffix(".jsonl") else { continue };
-            if !is_uuid(id) || known.contains(id) || deleted_in_desktop(id, &names) {
+            if !is_uuid(id) || known.contains(&id.to_ascii_lowercase()) || deleted_in_desktop(id, &names) {
                 continue;
             }
             pending.push((id.to_string(), project.path().join(name)));
@@ -67,7 +67,7 @@ pub fn import_cli_sessions(code_dir: &Path, sessions_dir: &Path) -> Result<Impor
     Ok(report)
 }
 
-/// Desktop 已有记录里出现过的所有会话 id（包括续接、分叉留下的旧 id），避免重复登记。
+/// Desktop 已有记录（或删除墓碑）里出现过的所有会话 id（包括续接、分叉留下的旧 id），避免重复登记。
 fn known_session_ids(sessions_dir: &Path) -> HashSet<String> {
     let mut known = HashSet::new();
     let Ok(entries) = fs::read_dir(sessions_dir) else {
@@ -75,6 +75,10 @@ fn known_session_ids(sessions_dir: &Path) -> HashSet<String> {
     };
     for entry in entries.flatten() {
         let name = entry.file_name().to_string_lossy().into_owned();
+        if let Some(id) = crate::session_sync::tombstone_id(&name) {
+            known.insert(id.to_ascii_lowercase());
+            continue;
+        }
         if !name.starts_with("local_") {
             continue;
         }
@@ -371,6 +375,29 @@ mod tests {
         assert_eq!(prompt_text(&json!("[Image #1] [Image #2] 这几个发到哪")).as_deref(), Some("这几个发到哪"));
         assert_eq!(placeholder_text(&json!("[Image #1]")).as_deref(), Some("[Image #1]"));
         assert_eq!(placeholder_text(&json!("<command-name>/model</command-name>")), None);
+    }
+
+    #[test]
+    fn skips_sessions_with_desktop_tombstones_in_sessions_dir() {
+        let temp = tempfile::tempdir().unwrap();
+        let code = temp.path().join(".claude");
+        let project = code.join("projects/-work-app");
+        fs::create_dir_all(&project).unwrap();
+        let t1 = "22222222-3333-4444-8555-666666666666";
+        let t2 = "33333333-4444-4555-8666-777777777777";
+        fs::write(project.join(format!("{t1}.jsonl")), transcript("")).unwrap();
+        fs::write(project.join(format!("{t2}.jsonl")), transcript("")).unwrap();
+
+        let sessions = temp.path().join("sessions");
+        fs::create_dir_all(&sessions).unwrap();
+        // Desktop 删除时只在 sessions_dir 留下无后缀 deleted_<uuid> 墓碑、projects 下保留 .jsonl 的场景
+        fs::write(sessions.join(format!("deleted_{t1}")), "1794895398549").unwrap();
+        fs::write(sessions.join(format!("deleted_{t2}.json")), "{}").unwrap();
+
+        let report = import_cli_sessions(&code, &sessions).unwrap();
+        assert_eq!(report, ImportReport { imported: 0, skipped_empty: 0 });
+        assert!(!sessions.join(format!("local_{t1}.json")).exists());
+        assert!(!sessions.join(format!("local_{t2}.json")).exists());
     }
 
     #[test]
