@@ -433,6 +433,41 @@ export function mergePoolModels(bootstrap, config) {
   if (config.hideUnroutedModels) dropUnroutedModels(bootstrap, config);
 }
 
+const LOCAL_ACCESS_FEATURES = new Set(["work_across_apps", "omelette"]);
+const COWORK_ACCESS_FEATURES = new Set([
+  "cowork",
+  "cowork_browser_pane",
+  "browser_data_import",
+  "cowork_watch_record",
+]);
+
+/**
+ * 解锁免费账号录制模板（如 2026-11-17 的 a4ced7f85b）中按套餐屏蔽的本地可用功能。
+ *
+ * 仅原地更新已有的 `features` 条目，不在无模板的合成空表里凭空造条目；
+ * 云端专属能力（Remote Control / Routines / Fast Mode 等）保持原状态。
+ */
+export function normalizeCurrentUserAccess(access, config) {
+  if (!isRecord(access) || !Array.isArray(access.features) || !access.features.length) return access;
+  const features = access.features.map((entry) => {
+    if (!isRecord(entry) || typeof entry.feature !== "string") return entry;
+    const name = entry.feature;
+    if (entry.status === "blocked_by_org_tier") {
+      const unlock = LOCAL_ACCESS_FEATURES.has(name) ||
+        (config.cowork && COWORK_ACCESS_FEATURES.has(name)) ||
+        (config.computerUse && name === "computer_use");
+      if (unlock) return { ...entry, status: "available" };
+    } else if (entry.status === "available") {
+      if ((!config.cowork && COWORK_ACCESS_FEATURES.has(name)) ||
+          (!config.computerUse && name === "computer_use")) {
+        return { ...entry, status: "blocked_by_org_tier" };
+      }
+    }
+    return entry;
+  });
+  return { ...access, features };
+}
+
 /** 选择器里的名称与副标题：有友好名用友好名（副标题是供应商），否则名称沿用模型 id、副标题为空。 */
 export function modelLabel(config, id) {
   const entry = config.modelNames?.[id];

@@ -32,6 +32,7 @@
 4. **托管模式启用本地主题渲染门控**（`crates/claude-local/runtime/proxy.mjs`）：`resolvedBootstrap` 调用 `enableLocalThemeRenderer` 注入 `THEME_RENDERER_FEATURE_IDS`。
 5. **托管模式隐藏不可下载的云端示例 Skills**（`crates/claude-local/runtime/proxy.mjs`）：无录制目录的托管模式下 `skills` 接口返回 `{ skills: [] }`，`download-dot-skill-file` 返回明确 404 JSON。
 6. **流式请求中断清理与关停销毁连接池**（`crates/claude-local/runtime/proxy.mjs`）：客户端提前断开时销毁 `upstreamReq`，`shutdown()` 时销毁 `directAgent` / `tunnelAgent`。
+7. **Claude Desktop v6.6395.0 1P/3P 能力适配**（`crates/claude-local/runtime/runtime.mjs`、`crates/claude-local/runtime/proxy.mjs`、`crates/claude-local/src/backend.rs`）：1P 模式通过 `normalizeCurrentUserAccess` 解锁免费模板（`a4ced7f85b`）被套餐屏蔽的本地能力（`cowork`、`cowork_browser_pane`、`browser_data_import`、`cowork_watch_record`、`work_across_apps`、`omelette`、受开关控制的 `computer_use`）并在 `/api/desktop/features` 下发内置浏览器与 Bridge Computer Use 门控；3P 模式在 `gateway_config_entry` 中启用 `builtinBrowserEnabled`、联动 `desktopHome` 并推断 `inferenceModels` 的 `supports1m` / `behavesAs`。
 
 ## 4. 标准自动化与验证命令（grokbot / Agent / 本机通用）
 
