@@ -28,7 +28,7 @@
 
 1. **模型展示名优先读取 `magpie_label`**（`apps/claude-mom/src-tauri/src/upstreams.rs`）：`parse_models` 按 `["magpie_label", "display_name"]` 顺序提取展示名。
 2. **本地代理异常退出自恢复与状态澄清**（`crates/claude-local/src/backend.rs`、`apps/claude-mom/src/model.ts`）：`recover_exited_proxy` 在配置未变时单次原端口拉起已退出的代理，前端通过 `restartMessage` 区分连接异常与配置变更。
-3. **合并池模型去锁与账单/分享接口兜底**（`crates/claude-local/runtime/proxy.mjs`）：`mergePoolModels` 通过 `stripModelLocks` 剥离免费录制模板的 `disabled` / `upgrade_required` 限制，并提供 `/shares` 与 `/api/billing/` 完整字段形状。
+3. **合并池模型去锁扩展与账单/分享接口兜底**（`crates/claude-local/runtime/runtime.mjs`、`crates/claude-local/runtime/proxy.mjs`）：上游 `v0.1.8`（#21）已将 `mergePoolModels` 与 `clearModelGates` 迁入 `runtime.mjs`，个人分支在 `runtime.mjs` 保留 `isUnlockedTemplateModel` 模板优选、`structuredClone` 深拷贝、`required_plan` 剥离及命中池内模型的 `minimum_tier = "free"` 重置，并在 `proxy.mjs` 提供 `/shares` 与 `/api/billing/` 完整字段形状。
 4. **托管模式启用本地主题渲染门控**（`crates/claude-local/runtime/proxy.mjs`）：`resolvedBootstrap` 调用 `enableLocalThemeRenderer` 注入 `THEME_RENDERER_FEATURE_IDS`。
 5. **托管模式隐藏不可下载的云端示例 Skills**（`crates/claude-local/runtime/proxy.mjs`）：无录制目录的托管模式下 `skills` 接口返回 `{ skills: [] }`，`download-dot-skill-file` 返回明确 404 JSON。
 6. **流式请求中断清理与关停销毁连接池**（`crates/claude-local/runtime/proxy.mjs`）：客户端提前断开时销毁 `upstreamReq`，`shutdown()` 时销毁 `directAgent` / `tunnelAgent`。

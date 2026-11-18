@@ -88,10 +88,17 @@ export const PERSONAL_INVARIANTS = [
   },
   {
     id: "INV-CUSTOM-03",
-    title: "合并池模型剥离免费模板套餐锁并兜底账单/分享形状",
+    title: "兜底账单字段与分享列表接口形状",
     file: "crates/claude-local/runtime/proxy.mjs",
-    mustContain: ["function stripModelLocks", "MODEL_LOCK_FIELDS", "taxDisplay:", "/shares$"],
-    fix: "检查 crates/claude-local/runtime/proxy.mjs 的 mergePoolModels 去锁逻辑及 /shares、/api/billing/ 响应字段。",
+    mustContain: ["taxDisplay:", "/shares$"],
+    fix: "检查 crates/claude-local/runtime/proxy.mjs 的 /shares、/api/billing/ 响应字段。",
+  },
+  {
+    id: "INV-CUSTOM-03B",
+    title: "合并池模型剥离免费模板套餐锁并重置可用模型最低套餐",
+    file: "crates/claude-local/runtime/runtime.mjs",
+    mustContain: ["function isUnlockedTemplateModel", '"required_plan"', 'entry.minimum_tier = "free"'],
+    fix: "检查 crates/claude-local/runtime/runtime.mjs 的 mergePoolModels 去锁与 avail minimum_tier 重置逻辑。",
   },
   {
     id: "INV-CUSTOM-04",
