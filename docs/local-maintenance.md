@@ -1,15 +1,15 @@
 # ClaudeMom 个人 Fork 维护与本地打包指南
 
-本手册规定个人 Fork（`Xavier189/ClaudeMom`）与作者上游仓库（`BigPizzaV3/ClaudeMom`）之间的分支门禁、自动上游同步、多 Agent 开发、本机真机实测签收及回滚规则。
+本手册规定个人 Fork（`Xavier189/ClaudeMom`）与作者上游仓库（`BigPizzaV3/ClaudeMom`）之间的分支门禁、自动上游同步、多 Agent 开发、本机真机实测签收、个人 macOS Release 发布及回滚规则。
 在 macOS 上构建并安装 `main` 分支需要 Node.js 22+、npm、Rust 工具链和 Xcode Command Line Tools。
 
-该流程只向个人 Fork 推送经脱敏身份提交的源码与 `local/verified-*` 本地验证标签，不修改作者上游仓库，也不产出带 Apple 公证签名或自动更新元数据的公开发行包。
+该流程只向个人 Fork 推送经脱敏身份提交的源码，并通过 [release-mac.mjs](../scripts/release-mac.mjs) 发布仅包含 macOS 安装包（ad-hoc 签名）的 `mac-v*` GitHub Release，不修改作者上游仓库，也不构建或发布 Windows 安装包。
 
 ## 远端、分支与门禁约定
 
 | 远端名 | 仓库地址 | 用途与推送限制 |
 | --- | --- | --- |
-| `origin` | `git@github.com:Xavier189/ClaudeMom.git` | 个人 Fork，托管默认黄金主线 `main`、上游干净镜像 `upstream-main` 与 `local/verified-*` 标签 |
+| `origin` | `git@github.com:Xavier189/ClaudeMom.git` | 个人 Fork，托管默认黄金主线 `main`、上游干净镜像 `upstream-main` 与个人 `mac-v*` 发行标签 |
 | `upstream` | `https://github.com/BigPizzaV3/ClaudeMom.git` | 作者上游仓库，只拉取更新；本地将 `pushurl` 设为 `no_push` 以防误推 |
 
 | 引用名 | 类型 | 规则与用途 |
@@ -17,7 +17,8 @@
 | `main` | 默认主分支 | **个人长期黄金主线**；服务端开启 Ruleset 禁止直推与强推，必须经 PR 验证通过后以 Merge Commit 合入（已停用 GitHub Actions） |
 | `upstream-main` | 镜像分支 | **作者上游干净镜像**；服务端禁止强推与删除，仅通过 `--ff-only` 同步 `upstream/main`，不在该分支提交任何个人改动 |
 | `sync/upstream-main` | 同步分支 | 由 [sync-upstream.mjs](../scripts/sync-upstream.mjs) 自动维护的上游同步 PR 分支 |
-| `local/verified-YYYYMMDD-HHMMSS` | 标签 | 本机完成真机交互验收并合入 `main` 后的回退锚点标签 |
+| `mac-v<version>-<shortsha>` | 发行标签 | 由 [release-mac.mjs](../scripts/release-mac.mjs) 创建并绑定 macOS-only GitHub Release（含 `.dmg`、`.app.zip` 与 `SHA256SUMS.txt`） |
+| `local/verified-YYYYMMDD-HHMMSS` | 标签 | 可选本机回滚锚点标签（执行 `verify-pr.mjs <PR> --tag` 或手动需要时推送） |
 | `v*`（例如 `v0.1.7`） | 标签 | 上游发版标签；服务端 Ruleset 已封禁在个人 Fork 创建或更新 `v*` 标签 |
 
 ## 检查或初始化仓库远端与本地钩子
@@ -89,32 +90,48 @@ gh pr create --base main --fill
   node scripts/verify-pr.mjs <PR编号>
   ```
   完整编译待测 `ClaudeMom.app`，先不覆盖已安装版本而直接启动待测实例供 Claude Desktop 真机交互验证：
-  - 输入 `pass`：自动备份 `~/.claude-mom` 与旧 `/Applications/ClaudeMom.app`，安装新包，执行 Merge Commit 合入 `main`，并打 `local/verified-YYYYMMDD-HHMMSS` 标签推送到 `origin`。
+  - 输入 `pass`：自动备份 `~/.claude-mom`、将旧 `/Applications/ClaudeMom.app` 归档为 `.app.zip` 并注销 LaunchServices 注册，安装新包并清理工作目录临时 `.app`，执行 Merge Commit 合入 `main`（如需同步推送 `local/verified-*` 标签可加 `--tag`）。
   - 输入 `fail <原因>`：保留原 `/Applications/ClaudeMom.app` 不变，将 PR 退回草稿并留言失败原因供 Agent 继续修复。
+
+### 4. 发布个人 macOS Release（仅 Mac，不含 Windows）
+
+PR 合入 `main` 且本地 `main` 已同步至最新 `origin/main` 后，运行 [release-mac.mjs](../scripts/release-mac.mjs)：
+
+```bash
+node scripts/release-mac.mjs           # 跑全套检查 → 构建 .dmg + .app.zip → 创建 mac-v<version>-<shortsha> Release
+node scripts/release-mac.mjs --install # 同上，并同步安全替换本地 /Applications/ClaudeMom.app
+```
+
+脚本只构建 macOS 产物并自动清理 `target/release/bundle/` 临时包，避免 Spotlight / Raycast 检索出重复 `ClaudeMom.app`。
 
 - **向作者上游提交纯净 PR**：不要从 `main` 直接向 `BigPizzaV3/ClaudeMom` 提 PR。从同步后的 `origin/upstream-main` 新建临时分支，只 `git cherry-pick <commit>` 通用修复提交后再提 PR。
 
 ## 手动本地打包与备份命令参考（不经 PR 调试时）
 
-1. 在干净工作区运行验证与打包命令：
+1. 最省事的方式是直接使用 `--install`（先退出 Claude 与 ClaudeMom）：
+
+   ```bash
+   node scripts/build-local.mjs --install
+   ```
+
+   脚本要求干净工作区与已退出状态，依次运行全套校验与打包后，自动备份并替换 `/Applications/ClaudeMom.app`，将旧应用归档为 `.app.zip`、注销 LaunchServices 旧注册，并清理 `target/release/bundle/macos/ClaudeMom.app` 防止系统搜出两个 ClaudeMom。
+
+2. 若仅构建检查（不自动替换 `/Applications/ClaudeMom.app`）：
 
    ```bash
    node scripts/build-local.mjs
    ```
 
-   脚本要求干净工作区，依次运行 `npm ci`、前端类型检查和测试、Rust workspace 测试、Node 后端测试、Tauri release 构建及签名校验。
-   npm 和 Cargo 使用仓库锁文件；任一步失败即停止，不安装或启动 App。测试证书在临时目录生成，用后删除，不加入系统信任。
-
    生成文件：
 
    | 路径 | 内容 |
    | --- | --- |
-   | `target/release/bundle/macos/ClaudeMom.app` | 本机架构的安装包 |
+   | `target/release/bundle/macos/ClaudeMom.app` | 本机架构的安装包（手动安装完毕后应删去此副本，防止 Spotlight 检索出两个应用） |
    | `target/local-build.json` | 源码提交、分支、构建时间、架构、版本和已签名二进制 SHA-256 |
 
    脚本使用 macOS 临时签名，不生成作者的自动更新包，也不读取作者的更新签名或公证凭据。安装包仅供本地使用，不等同于作者签名、公证的公开发行包。
 
-## 备份并安装
+## 手动备份并安装
 
 1. 完全退出 Claude 和 ClaudeMom，再执行以下命令。先将新安装包放入暂存位置并检查签名，校验通过后才移动已安装的 App。
 
@@ -127,20 +144,29 @@ gh pr create --base main --fill
 
    任一步报错都应停止，不继续替换。`target/local-build.json` 只在整套验证与打包成功后生成；开始下一次真实检查或构建时会删除，以免误用失败构建的记录。
 
-2. 备份程序和持久状态，再替换程序。保留终端中的 `claudemom_backup` 和 `claudemom_state_backup`，用于回滚。
+2. 备份程序与持久状态、压缩归档旧应用、安装新应用并清理 `target/` 重复副本：
 
    ```bash
+   claudemom_lsreg="/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister"
    claudemom_stamp=$(date +%Y%m%d-%H%M%S)
-   claudemom_backup="$HOME/.claude-mom/backups/ClaudeMom-before-local-$claudemom_stamp.app"
+   claudemom_raw_backup="$HOME/.claude-mom/backups/ClaudeMom-before-local-$claudemom_stamp.app"
+   claudemom_backup="${claudemom_raw_backup}.zip"
    claudemom_state_backup="$HOME/.claude-mom-snapshots/$claudemom_stamp"
    test -d "$claudemom_stage/ClaudeMom.app" &&
      codesign --verify --deep --strict "$claudemom_stage/ClaudeMom.app" &&
      mkdir -p "$HOME/.claude-mom/backups" "$HOME/.claude-mom-snapshots" &&
      chmod 700 "$HOME/.claude-mom-snapshots" &&
      ditto "$HOME/.claude-mom" "$claudemom_state_backup" &&
-     mv /Applications/ClaudeMom.app "$claudemom_backup" &&
+     "$claudemom_lsreg" -u /Applications/ClaudeMom.app 2>/dev/null || true &&
+     mv /Applications/ClaudeMom.app "$claudemom_raw_backup" &&
+     "$claudemom_lsreg" -u "$claudemom_raw_backup" 2>/dev/null || true &&
+     ditto -c -k --sequesterRsrc --keepParent "$claudemom_raw_backup" "$claudemom_backup" &&
+     rm -rf "$claudemom_raw_backup" &&
      mv "$claudemom_stage/ClaudeMom.app" /Applications/ClaudeMom.app &&
      rmdir "$claudemom_stage" &&
+     "$claudemom_lsreg" -u target/release/bundle/macos/ClaudeMom.app 2>/dev/null || true &&
+     rm -rf target/release/bundle/macos/ClaudeMom.app &&
+     "$claudemom_lsreg" -f /Applications/ClaudeMom.app 2>/dev/null || true &&
      open /Applications/ClaudeMom.app
    ```
 
@@ -190,9 +216,16 @@ gh pr create --base main --fill
 - **合并冲突或测试失败：**保留已安装 App，先修复源码及测试；不要运行安装步骤。需要撤销进行中的合并时用 `git merge --abort`。
 - **没有生效的 Rust 工具链：**脚本会沿用项目、环境或 rustup 已激活的工具链；没有激活版本且只安装了一个工具链时，会单次使用该版本。安装了多个版本时，运行 `rustup toolchain list`，再通过 `RUSTUP_TOOLCHAIN=<已安装版本> node scripts/build-local.mjs` 明确选择。脚本不修改全局默认版本。
 - **依赖下载连接被拒绝：**检查终端继承的代理是否仍在监听。需要单次去掉代理变量时，可用 `env -u HTTPS_PROXY -u HTTP_PROXY -u ALL_PROXY -u https_proxy -u http_proxy -u all_proxy node scripts/build-local.mjs`；网络依赖代理时，应先配置有效代理。
-- **安装后对话或 Code 回归：**完全退出两个 App，将失败的安装包移走，再从备份恢复。
+- **安装后对话或 Code 回归：**完全退出两个 App，将失败的安装包移走，再从 `.app.zip` 归档（或历史 `.app` 目录）备份恢复。
 
   ```bash
+  # 新版备份为 .app.zip：
+  test -n "${claudemom_backup:-}" && test -f "$claudemom_backup" &&
+    mv /Applications/ClaudeMom.app "/Applications/ClaudeMom.failed-local-$(date +%Y%m%d-%H%M%S).app" &&
+    ditto -x -k "$claudemom_backup" /Applications/ &&
+    open /Applications/ClaudeMom.app
+
+  # 历史未压缩 .app 目录备份：
   test -n "${claudemom_backup:-}" && test -d "$claudemom_backup" &&
     mv /Applications/ClaudeMom.app "/Applications/ClaudeMom.failed-local-$(date +%Y%m%d-%H%M%S).app" &&
     ditto "$claudemom_backup" /Applications/ClaudeMom.app &&
@@ -208,13 +241,13 @@ gh pr create --base main --fill
 个人 Fork 采用“同步上游至 `upstream-main` → 发起预合并 PR → `grokbot` / 本机 `verify-pr.mjs` 验证合入 `main`”的日常维护流程，需遵守以下边界：
 
 - **禁止点击应用内「检查更新」**：[tauri.conf.json](../apps/claude-mom/src-tauri/tauri.conf.json) 的 `plugins.updater.endpoints` 指向 `https://github.com/BigPizzaV3/ClaudeMom/releases/latest/download/latest.json`，安装它会用原作者发行包覆盖本地构建。
-- **禁止运行 `scripts/release.mjs` 或向 Fork 推送 `v*` 标签**：[release.mjs](../scripts/release.mjs) 已内置原作者仓库校验，且个人 Fork 远端 Ruleset 已封禁 `v*` 标签（[release.yml](../.github/workflows/release.yml) 依赖作者的 `TAURI_SIGNING_PRIVATE_KEY` 与 6 个 Apple 公证签名 Secret，个人 Fork 缺少凭据会直接失败）。
-- **本地开发调试入口**：[relaunch-local.mjs](../scripts/relaunch-local.mjs) 用于开发时启动构建目录内的实例，不会替换 `/Applications/ClaudeMom.app`。
-- **异机备份与离线归档**：PR 合入 `main` 及推送 `local/verified-*` 标签可完成源码与验证历史备份，但不包含 `target/` 构建产物与 `~/.claude-mom` 运行配置（含模型凭证）。如需离线全量归档仓库对象，可执行：
+- **禁止运行 `scripts/release.mjs` 或向 Fork 推送 `v*` 标签**：[release.mjs](../scripts/release.mjs) 已内置原作者仓库校验，且个人 Fork 远端 Ruleset 已封禁 `v*` 标签。个人 Fork 发版一律使用只构建 macOS 产物的 [release-mac.mjs](../scripts/release-mac.mjs)。
+- **本地开发调试入口**：[relaunch-local.mjs](../scripts/relaunch-local.mjs) 用于开发时启动构建目录内的实例，不会替换 `/Applications/ClaudeMom.app`（注意开发调试后清理 `target/release/bundle/macos/ClaudeMom.app`，以免 Spotlight 索引出两个应用）。
+- **异机备份与离线归档**：PR 合入 `main` 及通过 [release-mac.mjs](../scripts/release-mac.mjs) 发布 `mac-v*` Release 可完成源码与可用安装包归档；如需离线全量归档仓库对象，可执行：
 
 ```bash
 git bundle create "$HOME/ClaudeMom-local-source.bundle" --all
 git bundle verify "$HOME/ClaudeMom-local-source.bundle"
 ```
 
-相关入口：[README](../README.md)、[多 Agent 维护契约](../AGENTS.md)、[本地签收脚本](../scripts/verify-pr.mjs)、[本地构建脚本](../scripts/build-local.mjs)。
+相关入口：[README](../README.md)、[多 Agent 维护契约](../AGENTS.md)、[本地签收脚本](../scripts/verify-pr.mjs)、[本地构建脚本](../scripts/build-local.mjs)、[macOS 发版脚本](../scripts/release-mac.mjs)。

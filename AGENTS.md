@@ -10,7 +10,8 @@
 | `upstream-main` | **原作者仓库干净镜像** | 只允许对 `BigPizzaV3/ClaudeMom:main` 执行 `--ff-only` 快进同步，绝不提交任何定制改动。 |
 | `sync/upstream-main` | **自动上游同步 PR 分支** | 由 `node scripts/sync-upstream.mjs` 自动生成或更新；出现冲突或验证红灯时，Agent 在此分支修复并推回 PR。 |
 | `<type>/<topic>` | **功能与修复工作分支** | 所有新功能或缺陷修复一律从最新 `origin/main` 切出（如 `feat/xxx`、`fix/xxx`），完成后向 `main` 发起 PR。 |
-| `local/verified-*` | **本机实测回滚锚点标签** | 在本机完成真机交互实测后打标并显式推送到 `origin`。 |
+| `mac-v*` | **个人 macOS 发行标签** | 由 `node scripts/release-mac.mjs` 创建并附带 `.dmg` / `.app.zip` / `SHA256SUMS.txt` 发布到个人 Fork GitHub Release（仅面向 macOS）。 |
+| `local/verified-*` | **可选本机回滚锚点标签** | 仅在显式传 `--tag` 或手动排查需要时打标并推送到 `origin`。 |
 | `v*` | **原作者公开发版标签** | **严禁**在个人 Fork 新建或推送（GitHub Ruleset 已在服务端封禁）。 |
 
 ## 2. 平台范围与 Git 隐私红线
@@ -47,8 +48,14 @@ node --test scripts/*.test.mjs
 # 3. grokbot / 自动化 Agent 拉取待审 PR 验证并合入 main（隔离 worktree 预合并 + 全量测试，通过则自动 Merge，失败自动转草稿并留言）
 node scripts/verify-pr.mjs <PR编号> --auto        # 仅验证不合并可改用 --check-only
 
-# 4. 维护者本机打包 .app + Claude Desktop 真机交互实测签收合入（自动备份安装并推送 local/verified-* 标签）
-node scripts/verify-pr.mjs <PR编号>
+# 4. 维护者本机打包 .app + Claude Desktop 真机交互实测签收合入（自动归档旧包并防重复 Spotlight 索引）
+node scripts/verify-pr.mjs <PR编号>                 # 如需额外推送 local/verified-* 回滚标签可加 --tag
+
+# 5. 本机直接全量验证、安全安装 /Applications/ClaudeMom.app 并清理构建目录重复 .app
+node scripts/build-local.mjs --install
+
+# 6. 发布仅面向 macOS 的个人 Fork GitHub Release（mac-v<version>-<shortsha>，不含 Windows 产物）
+node scripts/release-mac.mjs [--install]
 ```
 
 ## 5. 上游同步冲突或验证失败修复 SOP
