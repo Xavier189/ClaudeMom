@@ -25,6 +25,7 @@ import os from "node:os";
 import path from "node:path";
 import process from "node:process";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import { formatOverlapSection } from "./sync-upstream.mjs";
 
 /**
  * 严格冻结的可信锁定义 (不可被外部覆盖)
@@ -496,12 +497,12 @@ export function getDedupKey(eventOrBatch) {
 /**
  * 构建触发事件 Payload（从 TRUSTED_LOCKS 硬编码复制元数据，绝不采信外部提权）
  */
-export function buildTriggerEvent({ batch, trusted = TRUSTED_LOCKS, now = Date.now() }) {
+export function buildTriggerEvent({ batch, trusted = TRUSTED_LOCKS, now = Date.now(), eventId = null } = {}) {
   const timestamp = typeof now === "number" ? now : new Date(now).getTime();
-  const eventId = `evt_${timestamp}_${(batch.headSha || "sha").slice(0, 8)}`;
+  const resolvedEventId = eventId || `evt_${timestamp}_${(batch?.headSha || "sha").slice(0, 8)}`;
   return {
-    id: eventId,
-    eventId,
+    id: resolvedEventId,
+    eventId: resolvedEventId,
     createdAt: new Date(timestamp).toISOString(),
     executor: trusted.executor,
     action: trusted.allowedActions[0],
@@ -904,6 +905,53 @@ export async function deliver({
 }
 
 /**
+ * 只读上游 SHA 查询适配器（仅用于 --allow-network，绝不写 refs、绝不 push、绝不 POST）
+ */
+export function createReadonlyUpstreamFetchAdapter({ git } = {}) {
+  const upstreamOwner = TRUSTED_LOCKS.upstream.owner;
+  const upstreamRepo = TRUSTED_LOCKS.upstream.repo;
+  const upstreamRef = TRUSTED_LOCKS.upstream.ref;
+  const remoteUrl = `https://github.com/${upstreamOwner}/${upstreamRepo}.git`;
+  const targetRef = `refs/heads/${upstreamRef}`;
+
+  return async function readonlyUpstreamFetchAdapter({ seenHead = null } = {}) {
+    let stdout;
+    if (typeof git === "function") {
+      const res = await git(["ls-remote", remoteUrl, targetRef]);
+      stdout = typeof res === "string" ? res : res?.stdout || "";
+    } else if (git && typeof git.exec === "function") {
+      const res = await git.exec(["ls-remote", remoteUrl, targetRef]);
+      stdout = typeof res === "string" ? res : res?.stdout || "";
+    } else {
+      const { execFile } = await import("node:child_process");
+      const { promisify } = await import("node:util");
+      const execFileAsync = promisify(execFile);
+      const res = await execFileAsync("git", ["ls-remote", remoteUrl, targetRef], {
+        timeout: 15000,
+        maxBuffer: 1024 * 1024,
+      });
+      stdout = res.stdout;
+    }
+
+    const trimmed = (stdout || "").trim();
+    if (!trimmed) {
+      return { headSha: null, commits: [] };
+    }
+    const lines = trimmed.split("\n");
+    for (const line of lines) {
+      const [sha, ref] = line.trim().split(/\s+/);
+      if (sha && (!ref || ref === targetRef)) {
+        return {
+          headSha: sha,
+          commits: [{ sha }],
+        };
+      }
+    }
+    return { headSha: null, commits: [] };
+  };
+}
+
+/**
  * 单次检测执行主流程 (One-shot runDetect)
  */
 export async function runDetect({
@@ -913,6 +961,8 @@ export async function runDetect({
   transport,
   onModelWake,
   backoff,
+  allowNetwork = false,
+  git = null,
 } = {}) {
   const validConfig = validateConfig(config);
   if (!validConfig.stateDir) {
@@ -925,10 +975,87 @@ export async function runDetect({
   try {
     const state = loadState(validConfig.stateDir);
 
+    // 重启后残留的 inflight 状态：上一进程可能在 POST 后崩溃，结果未知。
+    // 严禁盲目重发第二次，转换为 unknown 且持久化保留现场
+    if (state.send?.state === "inflight") {
+      state.send.state = "unknown";
+      state.send.lastError = "inflight_on_restart_outcome_unknown";
+      state.send.updatedAt = new Date(now).toISOString();
+      saveState(validConfig.stateDir, state);
+    }
+
+    // 1. 触发前鉴权授权（准入先行门禁）
+    const auth = authorizeTrigger({ payload: null, trusted: TRUSTED_LOCKS, config: validConfig });
+    if (!auth.ok) {
+      return {
+        ok: false,
+        reason: `authz_failed: ${auth.reason}`,
+        shouldTrigger: false,
+        modelWakeCount: 0,
+        postCount: 0,
+        state,
+      };
+    }
+
+    // 2. 告警激活检查
+    if (state.alarm) {
+      return {
+        ok: true,
+        shouldTrigger: false,
+        reason: `alarm_active: ${state.alarm.reason}`,
+        batch: null,
+        modelWakeCount: 0,
+        postCount: 0,
+        state,
+      };
+    }
+
+    // 3. 恢复未完成的待投递批次 (Resume unposted pending handoff)
+    // 若 openBatch 存在且 send 缺失或为 pending（未观察到 POST），在鉴权通过后直接恢复投递该现有批次，
+    // 无需等待新的上游提交，且绝不产生新的 event / batch。
+    const hasPendingBatch = Boolean(state.openBatch && (!state.send || state.send.state === "pending"));
+    if (hasPendingBatch) {
+      const batchToResume = state.openBatch;
+      const event = buildTriggerEvent({
+        batch: batchToResume,
+        trusted: TRUSTED_LOCKS,
+        now,
+        eventId: state.send?.eventId,
+      });
+
+      const deliverResult = await deliver({
+        state,
+        transport: transportInstance,
+        event,
+        now,
+        backoff: backoff || validConfig.backoff,
+        stateDir: validConfig.stateDir,
+      });
+      saveState(validConfig.stateDir, state);
+
+      return {
+        ok: true,
+        shouldTrigger: true,
+        reason: "resumed_pending_batch",
+        batch: batchToResume,
+        modelWakeCount: 0,
+        postCount: deliverResult.postCount,
+        deliverResult,
+        state,
+      };
+    }
+
+    // 4. 若开启 --allow-network 且未注入 adapter，使用只读检测适配器
+    let activeAdapter = adapter;
+    if (!activeAdapter && allowNetwork) {
+      activeAdapter = createReadonlyUpstreamFetchAdapter({ git });
+    }
+
+    // 5. 常规上游拉取与检测
     let fetchResult;
     try {
       fetchResult = await fetchUpstream({
-        adapter,
+        adapter: activeAdapter,
         trusted: TRUSTED_LOCKS,
         seenHead: state.seen?.headSha ?? null,
       });
@@ -1010,6 +1137,268 @@ export async function runDetect({
   }
 }
 
+const PROTECTED_INTEGRATION_BRANCHES = Object.freeze(new Set(["main", "upstream-main", "sync/upstream-main"]));
+
+const HOT_CUSTOM_FILES = Object.freeze([
+  "apps/claude-mom/src-tauri/src/upstreams.rs",
+  "crates/claude-local/src/backend.rs",
+  "apps/claude-mom/src/model.ts",
+  "crates/claude-local/runtime/proxy.mjs",
+  "scripts/check-invariants.mjs",
+]);
+
+/**
+ * 候选集成固定 SHA (仅在指定的临时仓库执行，绝不操作宿主 dev 仓库)
+ */
+export async function integrateFixedSha({
+  repoDir,
+  baseRef = "main",
+  upstreamSha,
+  workBranch,
+  testRunner,
+  git,
+  repair,
+} = {}) {
+  if (!repoDir || typeof repoDir !== "string" || repoDir.trim() === "") {
+    throw new Error("Missing required argument: repoDir (must be a non-empty path)");
+  }
+  if (!workBranch || typeof workBranch !== "string" || workBranch.trim() === "") {
+    throw new Error("Missing required argument: workBranch");
+  }
+
+  const trimmedBranch = workBranch.trim();
+  if (PROTECTED_INTEGRATION_BRANCHES.has(trimmedBranch)) {
+    throw new Error(`Refusing to use protected branch "${trimmedBranch}" as workBranch`);
+  }
+
+  if (!upstreamSha || typeof upstreamSha !== "string" || upstreamSha.trim() === "") {
+    throw new Error("Missing required argument: upstreamSha");
+  }
+
+  const trimmedUpstreamSha = upstreamSha.trim();
+  const targetBaseRef = (baseRef && typeof baseRef === "string" && baseRef.trim()) ? baseRef.trim() : "main";
+
+  const runGit = async (args) => {
+    if (typeof git === "function") {
+      const res = await git(args, { cwd: repoDir });
+      if (typeof res === "string") {
+        return { status: 0, stdout: res, stderr: "" };
+      }
+      return {
+        status: res?.status ?? 0,
+        stdout: res?.stdout || "",
+        stderr: res?.stderr || "",
+      };
+    } else if (git && typeof git.exec === "function") {
+      const res = await git.exec(args, { cwd: repoDir });
+      if (typeof res === "string") {
+        return { status: 0, stdout: res, stderr: "" };
+      }
+      return {
+        status: res?.status ?? 0,
+        stdout: res?.stdout || "",
+        stderr: res?.stderr || "",
+      };
+    }
+    const { execFile } = await import("node:child_process");
+    return new Promise((resolve) => {
+      execFile(
+        "git",
+        args,
+        {
+          cwd: repoDir,
+          encoding: "utf8",
+          env: {
+            ...process.env,
+            GIT_AUTHOR_NAME: "Xavier189",
+            GIT_AUTHOR_EMAIL: "63280269+Xavier189@users.noreply.github.com",
+            GIT_COMMITTER_NAME: "Xavier189",
+            GIT_COMMITTER_EMAIL: "63280269+Xavier189@users.noreply.github.com",
+          },
+        },
+        (error, stdout, stderr) => {
+          const status = error ? (typeof error.status === "number" ? error.status : (typeof error.code === "number" ? error.code : 1)) : 0;
+          resolve({
+            status,
+            stdout: stdout || "",
+            stderr: stderr || "",
+            error,
+          });
+        }
+      );
+    });
+  };
+
+  // 1. 验证 repoDir 是否为有效 git 仓库
+  const repoCheck = await runGit(["rev-parse", "--is-inside-work-tree"]);
+  if (repoCheck.status !== 0 || !repoCheck.stdout.includes("true")) {
+    throw new Error(`Directory "${repoDir}" is not a valid git repository`);
+  }
+
+  // 2. 解析 baseSha
+  const baseShaRes = await runGit(["rev-parse", targetBaseRef]);
+  if (baseShaRes.status !== 0) {
+    throw new Error(`Failed to resolve baseRef "${targetBaseRef}": ${baseShaRes.stderr}`);
+  }
+  const baseSha = baseShaRes.stdout.trim();
+
+  // 3. 从 baseRef 切出 workBranch
+  const checkoutRes = await runGit(["checkout", "--quiet", "-B", trimmedBranch, targetBaseRef]);
+  if (checkoutRes.status !== 0) {
+    throw new Error(`Failed to create work branch "${trimmedBranch}" from "${targetBaseRef}": ${checkoutRes.stderr}`);
+  }
+
+  // 4. 尝试合并 upstreamSha
+  const mergeRes = await runGit(["merge", "--no-ff", trimmedUpstreamSha, "-m", `Integrate upstream ${trimmedUpstreamSha}`]);
+
+  let conflict = false;
+  let conflictedFiles = [];
+
+  const unmergedDiff = await runGit(["diff", "--name-only", "--diff-filter=U"]);
+  const unmergedFiles = unmergedDiff.stdout
+    .split("\n")
+    .map((s) => s.trim())
+    .filter(Boolean);
+
+  if (unmergedFiles.length > 0) {
+    conflict = true;
+    conflictedFiles = unmergedFiles;
+  } else if (mergeRes.status !== 0) {
+    const statusRes = await runGit(["status", "--porcelain"]);
+    const conflictMarkers = ["UU ", "AA ", "UD ", "DU ", "DD ", "AU ", "UA "];
+    const statusConflicts = statusRes.stdout
+      .split("\n")
+      .filter((line) => conflictMarkers.some((m) => line.startsWith(m)))
+      .map((line) => line.slice(3).trim())
+      .filter(Boolean);
+    if (statusConflicts.length > 0) {
+      conflict = true;
+      conflictedFiles = statusConflicts;
+    }
+  }
+
+  let headSha = null;
+  let testsRan = false;
+  let testResult = null;
+  let prReady = false;
+  let ok = false;
+
+  if (conflict) {
+    if (typeof repair === "function") {
+      await repair({
+        repoDir,
+        workBranch: trimmedBranch,
+        conflictedFiles,
+        baseSha,
+        upstreamSha: trimmedUpstreamSha,
+        runGit,
+      });
+
+      const checkDiff = await runGit(["diff", "--name-only", "--diff-filter=U"]);
+      const remainingUnmerged = checkDiff.stdout
+        .split("\n")
+        .map((s) => s.trim())
+        .filter(Boolean);
+
+      if (remainingUnmerged.length === 0) {
+        const statusAfter = await runGit(["status", "--porcelain"]);
+        if (statusAfter.stdout.trim() !== "") {
+          await runGit(["commit", "-m", `Resolve conflicts integrating ${trimmedUpstreamSha}`]);
+        }
+        const headRes = await runGit(["rev-parse", "HEAD"]);
+        if (headRes.status === 0) {
+          headSha = headRes.stdout.trim();
+        }
+
+        if (typeof testRunner === "function") {
+          testsRan = true;
+          testResult = await testRunner({ repoDir, workBranch: trimmedBranch });
+          const testPassed = Boolean(testResult && testResult !== false && testResult.ok !== false);
+          prReady = testPassed;
+          ok = testPassed;
+        }
+      }
+    } else {
+      await runGit(["merge", "--abort"]);
+      testsRan = false;
+      testResult = null;
+      prReady = false;
+      ok = false;
+    }
+  } else {
+    const headRes = await runGit(["rev-parse", "HEAD"]);
+    if (headRes.status === 0) {
+      headSha = headRes.stdout.trim();
+    }
+
+    if (typeof testRunner === "function") {
+      testsRan = true;
+      testResult = await testRunner({ repoDir, workBranch: trimmedBranch });
+      const testPassed = Boolean(testResult && testResult !== false && testResult.ok !== false);
+      prReady = testPassed;
+      ok = testPassed;
+    } else {
+      testsRan = false;
+      testResult = null;
+      prReady = false;
+      ok = true;
+    }
+  }
+
+  let notes = "Mac packaging, app install, and Desktop verification are untested; Linux evidence is this script and node tests only.";
+  try {
+    const diffFilesRes = await runGit(["diff", "--name-only", baseSha, headSha || trimmedUpstreamSha]);
+    if (diffFilesRes.status === 0) {
+      const changedFiles = new Set(
+        diffFilesRes.stdout
+          .split("\n")
+          .map((s) => s.trim())
+          .filter(Boolean)
+      );
+      const hotFiles = HOT_CUSTOM_FILES.filter((f) => changedFiles.has(f));
+      if (hotFiles.length > 0) {
+        notes += "\n\n" + formatOverlapSection(hotFiles);
+      }
+    }
+  } catch {
+    // 忽略 diff 异常
+  }
+
+  return {
+    ok,
+    workBranch: trimmedBranch,
+    baseSha,
+    headSha,
+    conflict,
+    conflictedFiles,
+    testsRan,
+    testResult,
+    prReady,
+    notes,
+  };
+}
+
+/**
+ * 格式化 PR 描述正文（说明 Issue 创建状态、关联任务、审核门禁与调度器状态）
+ */
+export function formatImplementationPrBody({ taskId = "CM-IMPL-001", issueStatus } = {}) {
+  const issueNote = issueStatus || "GitHub Issue could not be created (create_issue 403).";
+  return [
+    `## Task: ${taskId}`,
+    "",
+    `**Issue Status**: ${issueNote}`,
+    "",
+    "### Review & Merge Gate",
+    "- **Reviewer**: 不畏浮云",
+    "- **Merge Permission**: Only xavier may merge.",
+    "",
+    "### Safety Invariants",
+    "- Formal scheduler remains disabled.",
+    "- Production POST and production transport remain disabled.",
+    "- Mac packaging, app install, and Desktop verification are untested; Linux evidence is this script and node tests only.",
+  ].join("\n");
+}
+
 /**
  * 解析 CLI 命令行参数
  */
@@ -1021,11 +1410,15 @@ export function parseArgs(argv) {
   let now = null;
   let adapterFile = null;
   let allowNetwork = false;
+  let repoDir = null;
+  let baseRef = null;
+  let upstreamSha = null;
+  let workBranch = null;
 
   const args = [...argv];
   if (args.length > 0 && !args[0].startsWith("-")) {
     subcommand = args.shift();
-    if (subcommand !== "detect") {
+    if (subcommand !== "detect" && subcommand !== "integrate") {
       throw new Error(`未知子命令 "${subcommand}"；使用 --help 查看用法`);
     }
   }
@@ -1060,6 +1453,30 @@ export function parseArgs(argv) {
       adapterFile = args[i];
     } else if (arg === "--allow-network") {
       allowNetwork = true;
+    } else if (arg === "--repo-dir") {
+      i++;
+      if (i >= args.length || args[i].startsWith("-")) {
+        throw new Error("缺少 --repo-dir 参数值");
+      }
+      repoDir = args[i];
+    } else if (arg === "--base-ref") {
+      i++;
+      if (i >= args.length || args[i].startsWith("-")) {
+        throw new Error("缺少 --base-ref 参数值");
+      }
+      baseRef = args[i];
+    } else if (arg === "--upstream-sha") {
+      i++;
+      if (i >= args.length || args[i].startsWith("-")) {
+        throw new Error("缺少 --upstream-sha 参数值");
+      }
+      upstreamSha = args[i];
+    } else if (arg === "--work-branch") {
+      i++;
+      if (i >= args.length || args[i].startsWith("-")) {
+        throw new Error("缺少 --work-branch 参数值");
+      }
+      workBranch = args[i];
     } else {
       throw new Error(`未知参数 "${arg}"；使用 --help 查看用法`);
     }
@@ -1073,6 +1490,10 @@ export function parseArgs(argv) {
     now,
     adapterFile,
     allowNetwork,
+    repoDir,
+    baseRef,
+    upstreamSha,
+    workBranch,
   };
 }
 
@@ -1088,55 +1509,91 @@ export async function main() {
   if (opts.help || !opts.subcommand) {
     console.log(`
 用法：
-  node scripts/upstream-watch.mjs detect --config <file> --state-dir <dir> [--now <ISO>]
+  node scripts/upstream-watch.mjs detect --config <file> --state-dir <dir> [--now <ISO>] [--allow-network]
+  node scripts/upstream-watch.mjs integrate --repo-dir <dir> --base-ref <ref> --upstream-sha <sha> --work-branch <name>
 
 说明：
-  单次执行 (One-shot) 监测公共固定上游 SHA，持久化状态并按阈值或计划执行离线 mock 触发。
+  detect:    单次监测公共固定上游 SHA，持久化状态并按阈值或计划执行离线 mock 触发。
+  integrate: 在隔离临时仓库中将固定 upstreamSha 合并入 workBranch，并执行测试挂钩。
   正式调度器与生产传输强制关闭，禁止作为常驻守护进程启动。
 `);
     process.exit(0);
   }
 
-  if (!opts.configFile) {
-    console.error("错误：detect 子命令必须提供 --config <file>");
-    process.exit(2);
-  }
+  if (opts.subcommand === "integrate") {
+    if (!opts.repoDir) {
+      console.error("错误：integrate 子命令必须提供 --repo-dir <dir>（严禁默认使用当前仓库）");
+      process.exit(2);
+    }
+    if (!opts.upstreamSha) {
+      console.error("错误：integrate 子命令必须提供 --upstream-sha <sha>");
+      process.exit(2);
+    }
+    if (!opts.workBranch) {
+      console.error("错误：integrate 子命令必须提供 --work-branch <name>");
+      process.exit(2);
+    }
 
-  let rawConfig;
-  try {
-    const configPath = path.resolve(opts.configFile);
-    rawConfig = JSON.parse(fs.readFileSync(configPath, "utf8"));
-  } catch (err) {
-    console.error(`读取配置文件失败：${err.message}`);
-    process.exit(2);
-  }
-
-  if (opts.stateDir) {
-    rawConfig.stateDir = path.resolve(opts.stateDir);
-  }
-
-  let adapter = null;
-  if (opts.adapterFile) {
     try {
-      const adapterModule = await import(pathToFileURL(path.resolve(opts.adapterFile)).href);
-      adapter = adapterModule.default || adapterModule.adapter || adapterModule;
+      const result = await integrateFixedSha({
+        repoDir: path.resolve(opts.repoDir),
+        baseRef: opts.baseRef || "main",
+        upstreamSha: opts.upstreamSha,
+        workBranch: opts.workBranch,
+      });
+      console.log(JSON.stringify(result, null, 2));
+      process.exit(result.ok ? 0 : 1);
     } catch (err) {
-      console.error(`加载 adapter 文件失败：${err.message}`);
+      console.error(`集成失败：${err.message}`);
       process.exit(2);
     }
   }
 
-  try {
-    const result = await runDetect({
-      config: rawConfig,
-      now: opts.now || Date.now(),
-      adapter,
-    });
-    console.log(JSON.stringify(result, null, 2));
-    process.exit(result.ok ? 0 : 1);
-  } catch (err) {
-    console.error(`运行检测失败：${err.message}`);
-    process.exit(2);
+  if (opts.subcommand === "detect") {
+    if (!opts.configFile) {
+      console.error("错误：detect 子命令必须提供 --config <file>");
+      process.exit(2);
+    }
+
+    let rawConfig;
+    try {
+      const configPath = path.resolve(opts.configFile);
+      rawConfig = JSON.parse(fs.readFileSync(configPath, "utf8"));
+    } catch (err) {
+      console.error(`读取配置文件失败：${err.message}`);
+      process.exit(2);
+    }
+
+    if (opts.stateDir) {
+      rawConfig.stateDir = path.resolve(opts.stateDir);
+    }
+
+    let adapter = null;
+    if (opts.adapterFile) {
+      try {
+        const adapterModule = await import(pathToFileURL(path.resolve(opts.adapterFile)).href);
+        adapter = adapterModule.default || adapterModule.adapter || adapterModule;
+      } catch (err) {
+        console.error(`加载 adapter 文件失败：${err.message}`);
+        process.exit(2);
+      }
+    } else if (opts.allowNetwork) {
+      adapter = createReadonlyUpstreamFetchAdapter();
+    }
+
+    try {
+      const result = await runDetect({
+        config: rawConfig,
+        now: opts.now || Date.now(),
+        adapter,
+        allowNetwork: opts.allowNetwork,
+      });
+      console.log(JSON.stringify(result, null, 2));
+      process.exit(result.ok ? 0 : 1);
+    } catch (err) {
+      console.error(`运行检测失败：${err.message}`);
+      process.exit(2);
+    }
   }
 }
 

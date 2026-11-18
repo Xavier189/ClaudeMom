@@ -11,6 +11,7 @@ import {
   buildTriggerEvent,
   createDefaultState,
   createMockTransport,
+  createReadonlyUpstreamFetchAdapter,
   deliver,
   evaluateTrigger,
   fetchUpstream,
@@ -752,6 +753,10 @@ test("20. HELP / parseArgs reject unknown flags", () => {
     now: null,
     adapterFile: null,
     allowNetwork: false,
+    repoDir: null,
+    baseRef: null,
+    upstreamSha: null,
+    workBranch: null,
   });
 
   assert.equal(parseArgs(["-h"]).help, true);
@@ -775,6 +780,248 @@ test("20. HELP / parseArgs reject unknown flags", () => {
   assert.equal(parsed.configFile, "test-cfg.json");
   assert.equal(parsed.stateDir, "/tmp/test-state");
   assert.equal(parsed.now, "2026-11-18T00:00:00.000Z");
+});
+
+test("21. Regression: resume unposted pending handoff; inflight/unknown do not POST again and keep record", async () => {
+  // Case A: openBatch + seen saved, send is null -> resumes batch, completes first POST, does not drop it
+  {
+    const stateDir = makeTempDir();
+    try {
+      const state = createDefaultState();
+      state.seen = { headSha: "sha_batch_2", commitShas: ["sha_batch_1", "sha_batch_2"] };
+      state.openBatch = {
+        baseSha: "sha_batch_0",
+        headSha: "sha_batch_2",
+        commitShas: ["sha_batch_1", "sha_batch_2"],
+        createdAt: "2026-11-18T00:00:00.000Z",
+      };
+      state.send = null;
+      saveState(stateDir, state);
+
+      const config = createBaseConfig({ stateDir });
+      const transport = createMockTransport({ behavior: 200 });
+      // Adapter returns already-seen commits (0 new commits)
+      const adapter = async () => ({
+        headSha: "sha_batch_2",
+        commits: [{ sha: "sha_batch_1" }, { sha: "sha_batch_2" }],
+      });
+
+      const result = await runDetect({ config, adapter, transport });
+      assert.equal(result.ok, true);
+      assert.equal(result.shouldTrigger, true);
+      assert.equal(result.postCount, 1);
+      assert.equal(transport.postCount, 1);
+      assert.equal(result.deliverResult.state, "accepted");
+
+      const stateAfter = loadState(stateDir);
+      assert.equal(stateAfter.send.state, "accepted");
+      assert.equal(stateAfter.openBatch, null);
+      assert.equal(stateAfter.processed.headSha, "sha_batch_2");
+    } finally {
+      cleanTempDir(stateDir);
+    }
+  }
+
+  // Case B: openBatch + seen saved, send is pending -> resumes batch and completes POST
+  {
+    const stateDir = makeTempDir();
+    try {
+      const state = createDefaultState();
+      state.seen = { headSha: "sha_batch_2", commitShas: ["sha_batch_1", "sha_batch_2"] };
+      state.openBatch = {
+        baseSha: "sha_batch_0",
+        headSha: "sha_batch_2",
+        commitShas: ["sha_batch_1", "sha_batch_2"],
+        createdAt: "2026-11-18T00:00:00.000Z",
+      };
+      state.send = {
+        eventId: "evt_existing_pending",
+        state: "pending",
+        attempts: 0,
+        lastHttpStatus: null,
+        lastError: null,
+        updatedAt: "2026-11-18T00:00:00.000Z",
+      };
+      saveState(stateDir, state);
+
+      const config = createBaseConfig({ stateDir });
+      const transport = createMockTransport({ behavior: 200 });
+      const adapter = async () => ({
+        headSha: "sha_batch_2",
+        commits: [],
+      });
+
+      const result = await runDetect({ config, adapter, transport });
+      assert.equal(result.ok, true);
+      assert.equal(result.shouldTrigger, true);
+      assert.equal(result.postCount, 1);
+      assert.equal(transport.postCount, 1);
+      assert.equal(transport.calls[0].event.id, "evt_existing_pending");
+
+      const stateAfter = loadState(stateDir);
+      assert.equal(stateAfter.send.state, "accepted");
+      assert.equal(stateAfter.openBatch, null);
+    } finally {
+      cleanTempDir(stateDir);
+    }
+  }
+
+  // Case C: openBatch exists but authz fails -> does not POST, returns authz failure
+  {
+    const stateDir = makeTempDir();
+    try {
+      const state = createDefaultState();
+      state.seen = { headSha: "sha_batch_2", commitShas: ["sha_batch_1", "sha_batch_2"] };
+      state.openBatch = {
+        baseSha: "sha_batch_0",
+        headSha: "sha_batch_2",
+        commitShas: ["sha_batch_1", "sha_batch_2"],
+        createdAt: "2026-11-18T00:00:00.000Z",
+      };
+      state.send = null;
+      saveState(stateDir, state);
+
+      // config violates transport authz (productionEnabled true)
+      const config = createBaseConfig({
+        stateDir,
+        transport: { mode: "mock", productionEnabled: true },
+      });
+
+      assert.throws(() => validateConfig(config), /生产传输通道处于硬关闭状态/);
+    } finally {
+      cleanTempDir(stateDir);
+    }
+  }
+
+  // Case D: send is inflight on restart -> converted to unknown, NO second POST, record kept
+  {
+    const stateDir = makeTempDir();
+    try {
+      const state = createDefaultState();
+      state.seen = { headSha: "sha_batch_2", commitShas: ["sha_batch_1", "sha_batch_2"] };
+      state.openBatch = {
+        baseSha: "sha_batch_0",
+        headSha: "sha_batch_2",
+        commitShas: ["sha_batch_1", "sha_batch_2"],
+        createdAt: "2026-11-18T00:00:00.000Z",
+      };
+      state.send = {
+        eventId: "evt_crashed_during_post",
+        state: "inflight",
+        attempts: 1,
+        lastHttpStatus: null,
+        lastError: null,
+        updatedAt: "2026-11-18T00:00:00.000Z",
+      };
+      saveState(stateDir, state);
+
+      const config = createBaseConfig({ stateDir });
+      const transport = createMockTransport({ behavior: 200 });
+      const adapter = async () => ({
+        headSha: "sha_batch_2",
+        commits: [{ sha: "sha_batch_1" }, { sha: "sha_batch_2" }],
+      });
+
+      const result = await runDetect({ config, adapter, transport });
+      assert.equal(result.postCount, 0);
+      assert.equal(transport.postCount, 0, "Must not perform second POST");
+
+      const stateAfter = loadState(stateDir);
+      assert.equal(stateAfter.send.state, "unknown");
+      assert.ok(stateAfter.openBatch, "openBatch record must be kept");
+      assert.equal(stateAfter.openBatch.headSha, "sha_batch_2");
+    } finally {
+      cleanTempDir(stateDir);
+    }
+  }
+
+  // Case E: send is unknown -> NO second POST, record kept
+  {
+    const stateDir = makeTempDir();
+    try {
+      const state = createDefaultState();
+      state.seen = { headSha: "sha_batch_2", commitShas: ["sha_batch_1", "sha_batch_2"] };
+      state.openBatch = {
+        baseSha: "sha_batch_0",
+        headSha: "sha_batch_2",
+        commitShas: ["sha_batch_1", "sha_batch_2"],
+        createdAt: "2026-11-18T00:00:00.000Z",
+      };
+      state.send = {
+        eventId: "evt_prior_500",
+        state: "unknown",
+        attempts: 2,
+        lastHttpStatus: 500,
+        lastError: "HTTP 500",
+        updatedAt: "2026-11-18T00:01:00.000Z",
+      };
+      saveState(stateDir, state);
+
+      const config = createBaseConfig({ stateDir });
+      const transport = createMockTransport({ behavior: 200 });
+      const adapter = async () => ({
+        headSha: "sha_batch_2",
+        commits: [{ sha: "sha_batch_1" }, { sha: "sha_batch_2" }],
+      });
+
+      const result = await runDetect({ config, adapter, transport });
+      assert.equal(result.postCount, 0);
+      assert.equal(transport.postCount, 0, "Must not retry POST when send is unknown");
+
+      const stateAfter = loadState(stateDir);
+      assert.equal(stateAfter.send.state, "unknown");
+      assert.ok(stateAfter.openBatch, "openBatch record must be kept");
+    } finally {
+      cleanTempDir(stateDir);
+    }
+  }
+});
+
+test("22. --allow-network and createReadonlyUpstreamFetchAdapter with fake git runner; default remains offline", async () => {
+  const fakeRemoteSha = "0123456789abcdef0123456789abcdef01234567";
+  let runnerCalled = false;
+  const fakeGit = async (args) => {
+    runnerCalled = true;
+    assert.equal(args[0], "ls-remote");
+    assert.equal(args[1], "https://github.com/BigPizzaV3/ClaudeMom.git");
+    assert.equal(args[2], "refs/heads/main");
+    return `${fakeRemoteSha}\trefs/heads/main\n`;
+  };
+
+  // 1. 直接测试 createReadonlyUpstreamFetchAdapter 行为
+  const adapter = createReadonlyUpstreamFetchAdapter({ git: fakeGit });
+  const fetchRes = await adapter();
+  assert.equal(runnerCalled, true);
+  assert.equal(fetchRes.headSha, fakeRemoteSha);
+  assert.deepEqual(fetchRes.commits, [{ sha: fakeRemoteSha }]);
+
+  // 2. 默认 runDetect（无 --allow-network，无 adapter）：绝不连接网络，抛出 FetchNetworkError
+  const stateDir = makeTempDir();
+  try {
+    const config = createBaseConfig({ stateDir });
+    const detectDefault = await runDetect({ config });
+    assert.equal(detectDefault.ok, false);
+    assert.equal(detectDefault.error, "fetch_error");
+    assert.match(detectDefault.message, /未注入 fetch adapter 且离线单元禁用网络请求/);
+    assert.equal(detectDefault.postCount, 0);
+
+    // 3. 在 runDetect 中传入 allowNetwork: true 和 injected fake git runner：离线完成检测
+    runnerCalled = false;
+    const transport = createMockTransport({ behavior: 200 });
+    const detectWithNetwork = await runDetect({
+      config,
+      allowNetwork: true,
+      git: fakeGit,
+      transport,
+    });
+    assert.equal(runnerCalled, true);
+    assert.equal(detectWithNetwork.ok, true);
+    // 观察到 headSha
+    const state = loadState(stateDir);
+    assert.equal(state.seen.headSha, fakeRemoteSha);
+  } finally {
+    cleanTempDir(stateDir);
+  }
 });
 
 test("Additional helper validations: nextBackoffMs, isScheduleMatch, getDedupKey", () => {
