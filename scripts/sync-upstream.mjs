@@ -20,6 +20,7 @@ export const HOT_CUSTOMIZED_FILES = [
   "apps/claude-mom/src/model.ts",
   "apps/claude-mom/src-tauri/tauri.conf.json",
   "crates/claude-local/runtime/proxy.mjs",
+  "crates/claude-local/runtime/runtime.mjs",
   "crates/claude-local/src/backend.rs",
 ];
 

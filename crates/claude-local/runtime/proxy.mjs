@@ -27,7 +27,7 @@ import zlib from "node:zlib";
 import { fileURLToPath } from "node:url";
 import { createConversationService } from "./conversation-service.mjs";
 import { isPatchedStartupAsset, startupAssets } from "./scripts/patch-dictation-start.mjs";
-import { createGatewayStreamParser, createStateStore, dropUnroutedModels, gatewayBody, gatewayHttpError, gatewayModel, gatewayTarget, isPrivateFile, modelLabel, modelList, modelSelectors, modelWindow, planProfile, runtimeConfig } from "./runtime.mjs";
+import { createGatewayStreamParser, createStateStore, gatewayBody, gatewayHttpError, gatewayModel, gatewayTarget, isPrivateFile, mergePoolModels, modelList, modelSelectors, modelWindow, planProfile, runtimeConfig } from "./runtime.mjs";
 import { createOfficialAssets } from "./official-assets.mjs";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -695,124 +695,6 @@ function localBootstrap() {
   });
 }
 
-// 选择器里显示的名称与副标题：有友好名用友好名（副标题是供应商），否则沿用模型 id。
-const friendlyName = (id) => modelLabel(runtime, id).name;
-const friendlyDescription = (id) => modelLabel(runtime, id).description || id;
-
-const MODEL_LOCK_FIELDS = [
-  "disabled",
-  "disabled_reason",
-  "selection_notice",
-  "badge",
-  "tooltip",
-  "notice",
-  "notice_text",
-  "inactive",
-  "min_claude_code_version",
-  "required_plan",
-];
-
-function stripModelLocks(entry, defaults = {}) {
-  if (!entry || typeof entry !== "object") return entry;
-  const clean = { ...entry };
-  for (const field of MODEL_LOCK_FIELDS) delete clean[field];
-  return Object.assign(clean, defaults);
-}
-
-function isUnlockedTemplateModel(entry) {
-  return Boolean(entry && typeof entry === "object" && !entry.disabled && !entry.disabled_reason && !entry.selection_notice && !entry.inactive);
-}
-
-// PoC 数据路径下：把网关池模型并入录制 bootstrap 的模型字段。
-// 原生条目先拿来当新条目的模板；`hideUnroutedModels`（默认开）时最后再把它们删掉，
-// 选择器里只剩池内 provider/model 条目。
-function mergePoolModels(j) {
-  const ids = runtime.models;
-  if (!j || typeof j !== "object" || !ids.length) return;
-  const cfg = j.activeOrganization?.claude_ai_bootstrap_models_config;
-  if (Array.isArray(cfg)) {
-    const seen = new Set(cfg.map((m) => m?.model));
-    const tpl = cfg.find(isUnlockedTemplateModel)
-      ?? cfg.find((m) => m && !m.disabled && !m.disabled_reason && !m.inactive)
-      ?? cfg[0]
-      ?? {};
-    const cleanTpl = stripModelLocks(tpl);
-    for (let i = 0; i < cfg.length; i += 1) {
-      const entry = cfg[i];
-      if (entry && runtime.models.includes(entry.model)) {
-        cfg[i] = {
-          ...stripModelLocks(entry),
-          hard_limit: modelWindow(runtime, entry.model),
-          context_window: modelWindow(runtime, entry.model),
-        };
-      }
-    }
-    for (const id of ids) {
-      if (!seen.has(id)) cfg.push({
-        ...structuredClone(cleanTpl),
-        model: id,
-        name: friendlyName(id),
-        description: friendlyDescription(id),
-        hard_limit: modelWindow(runtime, id),
-        context_window: modelWindow(runtime, id),
-      });
-    }
-  }
-  const avail = j.claude_ai_available_models?.models;
-  if (Array.isArray(avail)) {
-    const seen = new Set(avail.map((m) => m?.model_id));
-    for (const entry of avail) {
-      if (entry && runtime.models.includes(entry.model_id)) entry.minimum_tier = "free";
-    }
-    for (const id of ids) {
-      if (!seen.has(id)) avail.push({ model_id: id, minimum_tier: "free" });
-    }
-  }
-  if (Array.isArray(j.model_selector_config)) {
-    for (const sel of j.model_selector_config) {
-      if (!Array.isArray(sel?.models)) continue;
-      const seen = new Set(sel.models.map((m) => m?.id));
-      // 免费账号录制的模板（如 a4ced7f85b）首条就是带 disabled:true + upgrade_required 的锁模型；
-      // 优先挑未锁定条目当模板，并对池内新增及同名命中条目统一剥离套餐限制与升级弹窗字段。
-      const tpl = sel.models.find(isUnlockedTemplateModel)
-        ?? sel.models.find((m) => m && !m.disabled && !m.disabled_reason && !m.inactive)
-        ?? sel.models[0]
-        ?? {};
-      const cleanTpl = stripModelLocks(tpl, { disabled: false, disabled_reason: null });
-      for (let i = 0; i < sel.models.length; i += 1) {
-        const entry = sel.models[i];
-        if (entry && runtime.models.includes(entry.id)) {
-          sel.models[i] = {
-            ...stripModelLocks(entry, { disabled: false, disabled_reason: null }),
-            hard_limit: modelWindow(runtime, entry.id),
-            context_window: modelWindow(runtime, entry.id),
-            runtime: { max_input_tokens: modelWindow(runtime, entry.id) },
-          };
-        }
-      }
-      for (const id of ids) {
-        if (!seen.has(id)) sel.models.push({
-          ...structuredClone(cleanTpl),
-          id,
-          name: friendlyName(id),
-          short_name: friendlyName(id),
-          description: friendlyDescription(id),
-          hard_limit: modelWindow(runtime, id),
-          context_window: modelWindow(runtime, id),
-          runtime: { max_input_tokens: modelWindow(runtime, id) },
-        });
-      }
-    }
-  }
-  if (Array.isArray(j.model_selector_state)) {
-    const thinking = { type: "effort", effort: "medium" };
-    j.model_selector_state = j.model_selector_state.map((s) => s && typeof s === "object"
-      ? { ...s, model: runtime.model, thinking_by_model: ids.map((id) => ({ id, thinking })) }
-      : s);
-  }
-  if (runtime.hideUnroutedModels) dropUnroutedModels(j, runtime);
-}
-
 function mockEdgeApi(req, res, url) {
   const p = url.pathname.replace(/\/+$/, "");
   if (p.includes("/edge-api/bootstrap")) {
@@ -904,7 +786,7 @@ function resolvedBootstrap() {
     result.gated_imports = {};
     result.gated_imports_build_id = officialAssets.buildId;
   }
-  mergePoolModels(result);
+  mergePoolModels(result, runtime);
   resolvedBootstrapCache = result;
   return result;
 }
