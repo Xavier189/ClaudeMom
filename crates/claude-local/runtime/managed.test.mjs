@@ -1336,6 +1336,9 @@ test("RPC replies carry the upstream's HTTP error and RPC conversations open wit
   const detail = await request(service, `/api/organizations/local/chat_conversations/${conv}`, { host: "claude.ai" });
   const messages = detail.json.chat_messages;
   assert.deepEqual(messages.map((m) => m.sender), ["human", "assistant"]);
+  for (const message of messages) {
+    for (const field of ["files", "files_v2", "attachments", "sync_sources"]) assert.deepEqual(message[field], [], field);
+  }
   assert.equal(messages[0].text, "case:http-401");
   assert.match(messages[1].text, /\[网关错误：上游返回 HTTP 401：invalid x-api-key\]$/);
   assert.equal(messages[1].parent_message_uuid, messages[0].uuid);
