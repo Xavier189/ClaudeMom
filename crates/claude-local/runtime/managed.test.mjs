@@ -105,8 +105,8 @@ async function request(instance, pathname, { host, body, type = "application/jso
 }
 
 async function start(extra = {}, runtimeDir = path.join(root, "runtime")) {
-  const ready = path.join(root, "ready.json");
-  const instanceId = `managed-test-${Date.now()}`;
+  const instanceId = `managed-test-${Date.now()}-${crypto.randomUUID().slice(0, 8)}`;
+  const ready = extra.CLAUDE_LOCAL_READY_FILE ?? path.join(root, `ready-${instanceId}.json`);
   const child = spawn(process.execPath, [path.join(runtimeDir, "proxy.mjs"), "--port", "0", "--mode", "mock", "--log", "0", "--ca", testCaDir], {
     env: {
       ...process.env,
@@ -141,7 +141,7 @@ async function start(extra = {}, runtimeDir = path.join(root, "runtime")) {
       if (receipt.instanceId === instanceId) {
         assert.equal(receipt.pid, child.pid);
         assert.ok(receipt.port > 0);
-        return { ...receipt, child, closed, output: () => output };
+        return { ...receipt, readyFile: ready, child, closed, output: () => output };
       }
     } catch {}
     await delay(10);
@@ -272,7 +272,7 @@ test("managed readiness reports an assigned port and health polling is not clien
   assert.equal(first.json.lastClientAt, null);
   assert.equal(second.json.lastClientAt, null);
   assert.equal(Object.hasOwn(first.json, "token"), false);
-  assert.equal(fs.statSync(path.join(root, "ready.json")).mode & 0o777, 0o600);
+  assert.equal(fs.statSync(service.readyFile).mode & 0o777, 0o600);
   await request(service, "/api/bootstrap", { host: "claude.ai" });
   const active = await request(service, "/__codex_claude_local/health");
   assert.equal(typeof active.json.lastClientAt, "string");
@@ -418,10 +418,11 @@ test("outbound CONNECT TLS failures leave the managed proxy healthy", async () =
   });
   upstreamProxy.listen(0, "127.0.0.1");
   await once(upstreamProxy, "listening");
-  const instance = await start({
-    CLAUDE_LOCAL_UPSTREAM_PROXY: `http://127.0.0.1:${upstreamProxy.address().port}`,
-  });
+  let instance;
   try {
+    instance = await start({
+      CLAUDE_LOCAL_UPSTREAM_PROXY: `http://127.0.0.1:${upstreamProxy.address().port}`,
+    });
     for (failure of ["invalid", "closed"]) {
       const response = await request(instance, `/tls-${failure}.bin`, { host: "downloads.claude.ai" });
       assert.equal(response.status, 502);
