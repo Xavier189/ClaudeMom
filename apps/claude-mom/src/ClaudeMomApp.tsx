@@ -1,5 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
-import { Check, ChevronDown, Download, Eye, EyeOff, Loader2, Play, Plus, RefreshCw, ShieldCheck, Square, Trash2, X } from "lucide-react";
+import { ask, open } from "@tauri-apps/plugin-dialog";
+import { Check, ChevronDown, Download, Eye, EyeOff, FolderOpen, Loader2, PackagePlus, Play, Plus, Puzzle, RefreshCw, Server, ShieldCheck, SlidersHorizontal, Square, Trash2, X } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import {
   IMPORT_SOURCES,
@@ -19,13 +20,14 @@ import {
   type ClaudeConfig,
   type ClaudeStatus,
   type CommandResult,
+  type ExtensionInfo,
   type UpstreamBook,
   type UpstreamModel,
   type UpstreamProfile,
 } from "./model";
 import { checkForUpdate, currentVersion, installUpdate, type UpdateState } from "./updates";
 
-type Tab = "upstream" | "claude";
+type Tab = "upstream" | "claude" | "extensions";
 type Notice = { text: string; tone: "ok" | "error" } | null;
 type ClaudeAction = "launch" | "stop" | "trust" | "untrust" | "trust_machine" | "prepare" | "sync_sessions";
 
@@ -228,43 +230,77 @@ export function ClaudeMomApp() {
   const canLaunch = Boolean(status?.supported && status.nodeAvailable && (status.caTrusted || status.config.threePMode) && active && !profileProblem(active));
   const showStop = Boolean(status?.running || status?.localProcess);
 
+  const upstreamList = (
+    <div className="cm-sublist">
+      <div className="cm-sublist-head">
+        <span>上游</span>
+        <span className="cm-field-hint">「使用中」的那组生效</span>
+      </div>
+      <nav className="cm-list" aria-label="上游">
+        {book.profiles.map((profile) => (
+          <button
+            aria-current={profile.id === selectedId ? "true" : undefined}
+            className="cm-item"
+            key={profile.id}
+            onClick={() => select(profile.id)}
+            onDoubleClick={() => void bookCall("activate", "claude_mom_set_active", { id: profile.id }, profile.id)}
+            title="双击设为当前"
+            type="button"
+          >
+            <span className="cm-radio" data-on={profile.id === book.activeId || undefined} />
+            <span className="cm-item-text">
+              <span className="cm-item-name">{profile.name || hostOf(profile.baseUrl)}</span>
+              <span className="cm-item-sub">{profile.model ? modelLabel(profile, profile.model) : hostOf(profile.baseUrl)}</span>
+            </span>
+            {profile.source !== "manual" ? <span className="cm-tag">{SOURCE_LABELS[profile.source] ?? profile.source}</span> : null}
+          </button>
+        ))}
+        {draft && !draft.id ? (
+          <div className="cm-item" aria-current="true">
+            <span className="cm-radio" />
+            <span className="cm-item-text"><span className="cm-item-name">新上游</span><span className="cm-item-sub">未保存</span></span>
+          </div>
+        ) : null}
+        {!book.profiles.length && !draft ? <p className="cm-empty">还没有上游。手动添加，或从 cc-switch / Magpie / Codex++ 导入。</p> : null}
+      </nav>
+      <div className="cm-sublist-foot">
+        <button className="cm-btn cm-btn-quiet" onClick={addProfile} type="button"><Plus />添加</button>
+        <ImportMenu disabled={busy !== null} onPick={(source) => void bookCall("import", "claude_mom_import", { source }, selectedId)} />
+      </div>
+    </div>
+  );
+
+  const nav: { id: Tab; label: string; icon: ReactNode }[] = [
+    { id: "upstream", label: "上游", icon: <Server /> },
+    { id: "claude", label: "Claude 设置", icon: <SlidersHorizontal /> },
+    { id: "extensions", label: "扩展", icon: <Puzzle /> },
+  ];
+
   return (
     <div className="cm-shell">
       <aside className="cm-side">
         <div className="cm-side-head" data-tauri-drag-region>
           <span className="cm-brand">ClaudeMom</span>
         </div>
-        <div className="cm-side-label">上游</div>
-        <nav className="cm-list" aria-label="上游">
-          {book.profiles.map((profile) => (
-            <button
-              aria-current={profile.id === selectedId ? "true" : undefined}
-              className="cm-item"
-              key={profile.id}
-              onClick={() => select(profile.id)}
-              onDoubleClick={() => void bookCall("activate", "claude_mom_set_active", { id: profile.id }, profile.id)}
-              title="双击设为当前"
-              type="button"
-            >
-              <span className="cm-radio" data-on={profile.id === book.activeId || undefined} />
-              <span className="cm-item-text">
-                <span className="cm-item-name">{profile.name || hostOf(profile.baseUrl)}</span>
-                <span className="cm-item-sub">{profile.model ? modelLabel(profile, profile.model) : hostOf(profile.baseUrl)}</span>
-              </span>
-              {profile.source !== "manual" ? <span className="cm-tag">{SOURCE_LABELS[profile.source] ?? profile.source}</span> : null}
+        <nav className="cm-nav" aria-label="页面">
+          {nav.map((item) => (
+            <button aria-current={tab === item.id ? "page" : undefined} className="cm-nav-item" key={item.id} onClick={() => setTab(item.id)} type="button">
+              {item.icon}{item.label}
             </button>
           ))}
-          {draft && !draft.id ? (
-            <div className="cm-item" aria-current="true">
-              <span className="cm-radio" />
-              <span className="cm-item-text"><span className="cm-item-name">新上游</span><span className="cm-item-sub">未保存</span></span>
-            </div>
-          ) : null}
-          {!book.profiles.length && !draft ? <p className="cm-empty">还没有上游。手动添加，或从 cc-switch / Magpie / Codex++ 导入。</p> : null}
         </nav>
         <div className="cm-side-foot">
-          <button className="cm-btn cm-btn-quiet" onClick={addProfile} type="button"><Plus />添加</button>
-          <ImportMenu disabled={busy !== null} onPick={(source) => void bookCall("import", "claude_mom_import", { source }, selectedId)} />
+          <span>ClaudeMom {version}</span>
+          {status?.version ? <span>Claude {status.version}</span> : null}
+          {update.phase === "available" ? (
+            <button className="cm-update-chip" onClick={() => void runInstall()} type="button">更新到 {update.version}</button>
+          ) : update.phase === "downloading" ? (
+            <span className="cm-update-chip">正在更新{update.percent != null ? ` · ${update.percent}%` : "…"}</span>
+          ) : (
+            <button className="cm-link" disabled={update.phase === "checking"} onClick={() => void runUpdateCheck()} type="button">
+              {update.phase === "checking" ? "检查中…" : update.phase === "latest" ? "已是最新" : "检查更新"}
+            </button>
+          )}
         </div>
       </aside>
 
@@ -274,7 +310,7 @@ export function ClaudeMomApp() {
           <div className="cm-toolbar-text" data-tauri-drag-region>
             <strong>{state.text}</strong>
             <span>
-              {!status?.supported && status ? "需要先安装官方 Claude Desktop" : active ? `${active.name} · ${active.model ? modelLabel(active, active.model) : "未选模型"}` : "还没有上游"}
+              {!status?.supported && status ? "需要先安装官方 Claude Desktop" : active ? `当前上游：${active.name} · ${active.model ? modelLabel(active, active.model) : "未选模型"}` : "还没有上游"}
             </span>
           </div>
           <div className="cm-toolbar-actions">
@@ -307,58 +343,53 @@ export function ClaudeMomApp() {
           </div>
         ) : null}
 
-        <div className="cm-tabs" role="tablist">
-          <button aria-selected={tab === "upstream"} onClick={() => setTab("upstream")} role="tab" type="button">上游</button>
-          <button aria-selected={tab === "claude"} onClick={() => setTab("claude")} role="tab" type="button">Claude 设置</button>
-        </div>
-
-        <section className="cm-body">
-          {tab === "upstream" ? (
-            draft ? (
-              <UpstreamEditor
-                active={draft.id !== "" && draft.id === book.activeId}
-                busy={busy}
-                dirty={dirty}
-                draft={draft}
-                onActivate={() => void bookCall("activate", "claude_mom_set_active", { id: draft.id }, draft.id)}
-                onChange={setDraft}
-                onDelete={() => void bookCall("delete", "claude_mom_delete_profile", { id: draft.id })}
-                onDiscard={() => {
-                  const saved = book.profiles.find((profile) => profile.id === draft.id);
-                  if (saved) setDraft({ ...saved });
-                  else acceptBook({ ...book, status: "ok", message: "" });
-                }}
-                onFetchModels={() => void fetchModels()}
-                onSave={(activate) => void saveDraft(activate)}
-              />
+        {tab === "upstream" ? (
+          <div className="cm-split">
+            {upstreamList}
+            <section className="cm-body">
+              {draft ? (
+                <UpstreamEditor
+                  active={draft.id !== "" && draft.id === book.activeId}
+                  busy={busy}
+                  dirty={dirty}
+                  draft={draft}
+                  onActivate={() => void bookCall("activate", "claude_mom_set_active", { id: draft.id }, draft.id)}
+                  onChange={setDraft}
+                  onDelete={() => void bookCall("delete", "claude_mom_delete_profile", { id: draft.id })}
+                  onDiscard={() => {
+                    const saved = book.profiles.find((profile) => profile.id === draft.id);
+                    if (saved) setDraft({ ...saved });
+                    else acceptBook({ ...book, status: "ok", message: "" });
+                  }}
+                  onFetchModels={() => void fetchModels()}
+                  onSave={(activate) => void saveDraft(activate)}
+                />
+              ) : (
+                <div className="cm-placeholder">
+                  <p>选一组上游，或者新建一组。</p>
+                  <button className="cm-btn" onClick={addProfile} type="button"><Plus />添加上游</button>
+                </div>
+              )}
+            </section>
+          </div>
+        ) : (
+          <section className="cm-body">
+            {tab === "extensions" ? (
+              <Extensions onNotice={say} threePMode={Boolean(status?.config.threePMode)} />
             ) : (
-              <div className="cm-placeholder">
-                <p>选一组上游，或者新建一组。</p>
-                <button className="cm-btn" onClick={addProfile} type="button"><Plus />添加上游</button>
-              </div>
-            )
-          ) : (
-            <ClaudeSettings
-              busy={busy}
-              onAction={(action) => void claudeAction(action)}
-              onConfigure={(patch) => void configure(patch)}
-              onVoice={(enabled) => void setVoice(enabled)}
-              status={status}
-              update={update}
-              version={version}
-              onCheckUpdate={() => void runUpdateCheck()}
-              onInstallUpdate={() => void runInstall()}
-            />
-          )}
-        </section>
+              <ClaudeSettings
+                busy={busy}
+                onAction={(action) => void claudeAction(action)}
+                onConfigure={(patch) => void configure(patch)}
+                onVoice={(enabled) => void setVoice(enabled)}
+                status={status}
+              />
+            )}
+          </section>
+        )}
 
         <footer className="cm-status">
           <span>{status?.port ? `本地服务 · 端口 ${status.port}` : "本地服务未运行"}</span>
-          {update.phase === "available" ? (
-            <button className="cm-update-chip" onClick={() => void runInstall()} type="button">新版本 {update.version}，点此更新</button>
-          ) : update.phase === "downloading" ? (
-            <span className="cm-update-chip">正在更新到 {update.version}{update.percent != null ? ` · ${update.percent}%` : "…"}</span>
-          ) : null}
           {notice ? (
             <span className="cm-notice" data-tone={notice.tone} role={notice.tone === "error" ? "alert" : "status"}>
               {notice.text}
@@ -415,6 +446,19 @@ function Field({ label, hint, children }: { label: string; hint?: string; childr
       <span className="cm-field-control">{children}</span>
       {hint ? <span className="cm-field-hint">{hint}</span> : null}
     </label>
+  );
+}
+
+/** 全局页的标题：写明对所有上游生效，免得以为跟着左边选的上游走。 */
+function PageHead({ title, hint, children }: { title: string; hint: string; children?: ReactNode }) {
+  return (
+    <header className="cm-page-head">
+      <div className="cm-grow">
+        <h2>{title}<span className="cm-tag">所有上游通用</span></h2>
+        <p className="cm-field-hint">{hint}</p>
+      </div>
+      {children}
+    </header>
   );
 }
 
@@ -559,6 +603,97 @@ function Toggle({ label, detail, hint, checked, disabled, onChange }: { label: s
   );
 }
 
+type ExtensionsResult = CommandResult<{ extensions: ExtensionInfo[] }>;
+
+/** 页面扩展：注入 Claude 页面的 js / css 包。开关、导入、删除都是刷新 Claude 页面就生效。 */
+function Extensions({ threePMode, onNotice }: { threePMode: boolean; onNotice: (text: string, tone?: "ok" | "error") => void }) {
+  const [items, setItems] = useState<ExtensionInfo[] | null>(null);
+  const [busy, setBusy] = useState<string | null>(null);
+
+  const call = async (label: string, command: string, args: Record<string, unknown> = {}) => {
+    setBusy(label);
+    try {
+      const result = await invoke<ExtensionsResult>(command, args);
+      setItems(result.extensions ?? []);
+      if (result.message) onNotice(result.message, isOk(result) ? "ok" : "error");
+    } catch (cause) {
+      onNotice(errorText(cause), "error");
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  useEffect(() => {
+    void invoke<ExtensionsResult>("claude_local_extensions")
+      .then((result) => setItems(result.extensions ?? []))
+      .catch((cause) => onNotice(errorText(cause), "error"));
+    // 只在打开这一页时读一次；之后每个操作都会带回最新列表。
+  }, []);
+
+  const importPackage = async () => {
+    const path = await open({
+      directory: false,
+      multiple: false,
+      title: "选择扩展包的 .zip，或扩展文件夹里的 manifest.json",
+      filters: [{ name: "扩展包", extensions: ["zip", "json"] }],
+    });
+    if (typeof path === "string") await call("import", "claude_local_extension_import", { path });
+  };
+
+  const remove = async (item: ExtensionInfo) => {
+    const yes = await ask(`删除「${item.name}」？扩展文件夹会一起删掉。`, { title: "删除扩展", kind: "warning", okLabel: "删除", cancelLabel: "取消" });
+    if (yes) await call(`remove:${item.id}`, "claude_local_extension_remove", { id: item.id });
+  };
+
+  if (!items) return <div className="cm-placeholder"><Loader2 className="cm-spin" /></div>;
+  return (
+    <div className="cm-settings">
+      <PageHead hint="注入 Claude 页面的脚本和样式。开关、导入、删除后刷新 Claude 页面（Cmd/Ctrl+R）生效。" title="扩展">
+        <button className="cm-btn" disabled={busy !== null} onClick={() => void call("open", "claude_local_extension_open_folder")} type="button"><FolderOpen />打开文件夹</button>
+        <button className="cm-btn cm-btn-primary" disabled={busy !== null} onClick={() => void importPackage()} type="button">
+          {busy === "import" ? <Loader2 className="cm-spin" /> : <PackagePlus />}导入扩展包
+        </button>
+      </PageHead>
+      {threePMode ? <p className="cm-warn-text">当前是本机版界面：它不经本地服务，扩展不会生效。换回录制版界面后可用。</p> : null}
+      <p className="cm-field-hint">扩展在官方脚本之前运行，能读到页面里的一切（包括对话内容）。只装自己写的或信得过的。</p>
+      {items.map((item) => (
+        <section className="cm-card" key={item.id}>
+          <label className="cm-toggle-row">
+            <span className="cm-toggle-text">
+              <span className="cm-card-line">
+                <strong className="cm-ext-name">{item.name}</strong>
+                {item.version ? <span className="cm-tag cm-mono">v{item.version}</span> : null}
+                {item.builtin ? <span className="cm-tag">内置</span> : null}
+              </span>
+              {item.error
+                ? <span className="cm-warn-text cm-ext-desc">清单有问题：{item.error}</span>
+                : <span className="cm-field-hint cm-ext-desc">{item.description || "没有说明"}</span>}
+            </span>
+            <input
+              checked={item.enabled}
+              disabled={busy !== null || (Boolean(item.error) && !item.enabled)}
+              onChange={(event) => void call(`enable:${item.id}`, "claude_local_extension_enable", { id: item.id, enabled: event.currentTarget.checked })}
+              type="checkbox"
+            />
+            <span aria-hidden="true" className="cm-switch" />
+          </label>
+          <div className="cm-card-line cm-field-hint">
+            <span className="cm-mono">{item.id}</span>
+            {item.author ? <span>· {item.author}</span> : null}
+            <span className="cm-spacer" />
+            {item.builtin ? null : (
+              <button className="cm-btn cm-btn-small cm-btn-danger" disabled={busy !== null} onClick={() => void remove(item)} type="button"><Trash2 />删除</button>
+            )}
+          </div>
+        </section>
+      ))}
+      <p className="cm-field-hint">
+        扩展包是一个文件夹：manifest.json 写 id、name、version、author、description，以及要注入的 scripts（.js）和 styles（.css）。可以直接导入文件夹里的 manifest.json，或把文件夹打成 .zip 导入。
+      </p>
+    </div>
+  );
+}
+
 type ModelState = { modelReady: boolean; phase?: string; completedBytes?: number; totalBytes?: number; message?: string };
 
 /** 本地 SenseVoice 模型：状态、下载（约 230MB，和 Codex++ 共用 ~/.codex/speech-to-text）。 */
@@ -601,16 +736,12 @@ function VoiceModel({ onReady }: { onReady: () => void }) {
   );
 }
 
-function ClaudeSettings({ status, busy, onConfigure, onAction, onVoice, update, version, onCheckUpdate, onInstallUpdate }: {
+function ClaudeSettings({ status, busy, onConfigure, onAction, onVoice }: {
   status: ClaudeStatus | null;
   busy: string | null;
   onConfigure: (patch: Partial<ClaudeConfig>) => void;
   onAction: (action: ClaudeAction) => void;
   onVoice: (enabled: boolean) => void;
-  update: UpdateState;
-  version: string;
-  onCheckUpdate: () => void;
-  onInstallUpdate: () => void;
 }) {
   if (!status) return <div className="cm-placeholder"><Loader2 className="cm-spin" /></div>;
   const config = status.config;
@@ -630,6 +761,7 @@ function ClaudeSettings({ status, busy, onConfigure, onAction, onVoice, update, 
   );
   return (
     <div className="cm-settings">
+      <PageHead hint="Claude 桌面版的界面、语音、会话等。切换上游不会改动这里。" title="Claude 设置" />
       <section className="cm-card">
         <Field
           hint={config.threePMode
@@ -731,17 +863,6 @@ function ClaudeSettings({ status, busy, onConfigure, onAction, onVoice, update, 
             : <button className="cm-btn cm-btn-small" disabled={busy !== null} onClick={() => onAction("trust")} type="button"><ShieldCheck />信任</button>}
         </div>
       </details>
-
-      <div className="cm-about">
-        <span>ClaudeMom {version || ""}{status.version ? ` · Claude ${status.version}` : ""}</span>
-        {update.phase === "available" ? (
-          <button className="cm-link" onClick={onInstallUpdate} type="button">更新到 {update.version}</button>
-        ) : (
-          <button className="cm-link" disabled={update.phase === "checking" || update.phase === "downloading"} onClick={onCheckUpdate} type="button">
-            {update.phase === "checking" ? "检查中…" : update.phase === "latest" ? "已是最新" : "检查更新"}
-          </button>
-        )}
-      </div>
     </div>
   );
 }

@@ -1,7 +1,9 @@
 import crypto from "node:crypto";
 import fs from "node:fs";
+import net from "node:net";
 import path from "node:path";
 import { StringDecoder } from "node:string_decoder";
+import { validConnector } from "./connectors.mjs";
 import { installablePlugin } from "./plugins.mjs";
 
 const MAX_STATE_BYTES = 32 * 1024 * 1024;
@@ -107,6 +109,9 @@ export function runtimeConfig(env = process.env) {
     defaultWindow,
     recordedDir,
     localization: flag("LOCALIZATION"),
+    // 页面扩展（见 extensions.mjs）：先内置后用户的扩展目录，和记录启用了哪些的状态文件。
+    extensionDirs: [env.CLAUDE_LOCAL_BUILTIN_EXTENSIONS_DIR, env.CLAUDE_LOCAL_EXTENSIONS_DIR].filter(Boolean),
+    extensionsState: env.CLAUDE_LOCAL_EXTENSIONS_STATE || "",
     voiceInput: flag("VOICE_INPUT"),
     computerUse: flag("COMPUTER_USE"),
     backgroundMode: flag("BACKGROUND_MODE"),
@@ -616,8 +621,22 @@ function validateNotifications(entry) {
           ["push_source", "email_source"].includes(key) && isText(value, 64))));
 }
 
-/** `plugins`：装上的插件，id → 安装时那份目录记录。旧状态文件没有这一项。 */
-export function createStateStore(file, conversations, notifications, warn = () => {}, plugins = new Map()) {
+/**
+ * 本机和局域网里的地址。出站代理是按「怎么连 claude.ai」选出来的，系统代理的例外名单没带过来：
+ * 局域网里的上游（NAS、另一台机器上的网关）不能绕去代理，代理软件开着全局模式时会连不上。
+ */
+export function isLocalNetworkHost(hostname) {
+  const host = String(hostname).toLowerCase().replace(/^\[|\]$/g, "");
+  if (host === "localhost" || host.endsWith(".local") || !/[.:]/.test(host)) return true;
+  if (net.isIPv4(host)) return /^(?:10|127)\.|^192\.168\.|^169\.254\.|^172\.(?:1[6-9]|2\d|3[01])\./.test(host);
+  return net.isIPv6(host) && (host === "::1" || /^(?:f[cd]|fe[89ab])/.test(host));
+}
+
+/**
+ * `plugins`：装上的插件，id → 安装时那份目录记录。`connectors`：添加的连接器，uuid → 记录（含登录令牌）。
+ * 旧状态文件没有这两项。
+ */
+export function createStateStore(file, conversations, notifications, warn = () => {}, plugins = new Map(), connectors = new Map()) {
   let timer;
   let disabled = false;
   if (file && fs.existsSync(file)) {
@@ -629,7 +648,9 @@ export function createStateStore(file, conversations, notifications, warn = () =
         !Array.isArray(state.notifications) || state.notifications.length > 2000 ||
         !state.notifications.every(validateNotifications) ||
         !(state.plugins === undefined || Array.isArray(state.plugins) && state.plugins.length <= 500 &&
-          state.plugins.every(installablePlugin))) throw new Error("Invalid state contract");
+          state.plugins.every(installablePlugin)) ||
+        !(state.connectors === undefined || Array.isArray(state.connectors) && state.connectors.length <= 500 &&
+          state.connectors.every(validConnector))) throw new Error("Invalid state contract");
       for (const conv of state.conversations) {
         // 中断的请求不自动重发，避免重启后重复计费或执行。
         for (const turn of conv.turns) {
@@ -644,6 +665,7 @@ export function createStateStore(file, conversations, notifications, warn = () =
       }
       for (const entry of state.notifications) notifications.set(entry.org, entry.value);
       for (const entry of state.plugins ?? []) plugins.set(entry.id, entry);
+      for (const entry of state.connectors ?? []) connectors.set(entry.uuid, entry);
     } catch {
       disabled = true;
       warn("Local conversation state is invalid; the original file was preserved");
@@ -660,6 +682,7 @@ export function createStateStore(file, conversations, notifications, warn = () =
         conversations: [...conversations.values()],
         notifications: [...notifications].map(([org, value]) => ({ org, value })),
         plugins: [...plugins.values()],
+        connectors: [...connectors.values()],
       }));
       if (body.length > MAX_STATE_BYTES) throw new Error("State exceeds size limit");
       fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });

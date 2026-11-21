@@ -39,6 +39,94 @@ let dictationFrame;
 let finishDownload;
 const streamFixtureSize = 4 * 1024 * 1024;
 
+// 两个假的远程 MCP 服务器：mcp.demo.example 不用登录；mcp.auth.example 要 OAuth（授权服务器是 auth.example）。
+const mcpFixture = { calls: [], registrations: [], tokenRequests: [], challenge: "", validTokens: new Set(["token-1"]), refreshes: true };
+
+async function connectorFixture(req, res) {
+  const chunks = [];
+  for await (const chunk of req) chunks.push(chunk);
+  const raw = Buffer.concat(chunks).toString("utf8");
+  const host = req.headers.host;
+  const reply = (status, value, headers = {}) => {
+    res.writeHead(status, { "content-type": "application/json", ...headers });
+    res.end(value === undefined ? undefined : JSON.stringify(value));
+  };
+  if (host === "auth.example") {
+    if (req.url === "/.well-known/oauth-authorization-server") {
+      return reply(200, {
+        issuer: "https://auth.example", authorization_endpoint: "https://auth.example/authorize",
+        token_endpoint: "https://auth.example/token", registration_endpoint: "https://auth.example/register",
+      });
+    }
+    if (req.method === "POST" && req.url === "/register") {
+      mcpFixture.registrations.push(JSON.parse(raw));
+      return reply(201, { client_id: `client-${mcpFixture.registrations.length}` });
+    }
+    if (req.method === "POST" && req.url === "/token") {
+      const form = Object.fromEntries(new URLSearchParams(raw));
+      mcpFixture.tokenRequests.push(form);
+      if (form.grant_type === "refresh_token" && form.refresh_token === "refresh-1" && mcpFixture.refreshes) {
+        mcpFixture.validTokens.add("token-2");
+        return reply(200, { access_token: "token-2", expires_in: 3600 });
+      }
+      const challenge = crypto.createHash("sha256").update(form.code_verifier ?? "").digest("base64url");
+      if (form.grant_type === "authorization_code" && form.code === "code-1" && challenge === mcpFixture.challenge) {
+        return reply(200, { access_token: "token-1", refresh_token: "refresh-1", expires_in: 3600 });
+      }
+      return reply(400, { error: "invalid_grant" });
+    }
+    return reply(404, { error: "not found" });
+  }
+  if (host === "mcp.auth.example" && req.url === "/.well-known/oauth-protected-resource/mcp") {
+    return reply(200, { resource: "https://mcp.auth.example/mcp", authorization_servers: ["https://auth.example"], scopes_supported: ["read", "write"] });
+  }
+  if (req.method !== "POST" || req.url !== "/mcp") return reply(404, { error: "not found" });
+  if (host === "mcp.auth.example" && !mcpFixture.validTokens.has(String(req.headers.authorization).replace("Bearer ", ""))) {
+    return reply(401, { error: "unauthorized" }, {
+      "www-authenticate": 'Bearer resource_metadata="https://mcp.auth.example/.well-known/oauth-protected-resource/mcp"',
+    });
+  }
+  const message = JSON.parse(raw);
+  const session = `session-${host}`;
+  if (message.method === "initialize") {
+    return reply(200, {
+      jsonrpc: "2.0", id: message.id,
+      result: { protocolVersion: "2025-06-18", capabilities: { tools: {} }, serverInfo: { name: "fixture", version: "1" }, instructions: "Use the echo tool." },
+    }, { "mcp-session-id": session });
+  }
+  if (req.headers["mcp-session-id"] !== session) return reply(404, { error: "unknown session" });
+  if (message.method === "notifications/initialized") return reply(202);
+  if (message.method === "tools/list") {
+    // 用 SSE 回，而且不结束连接：客户端拿到答案就该自己收手。
+    res.writeHead(200, { "content-type": "text/event-stream" });
+    return res.write(`event: message\ndata: ${JSON.stringify({
+      jsonrpc: "2.0", id: message.id,
+      result: { tools: [{ name: "echo", description: "Echoes", inputSchema: { type: "object", properties: { text: { type: "string" } } }, annotations: { title: "Echo" } }] },
+    })}\n\n`);
+  }
+  if (message.method === "tools/call") {
+    mcpFixture.calls.push({ host, authorization: req.headers.authorization, params: message.params });
+    return reply(200, {
+      jsonrpc: "2.0", id: message.id,
+      result: { content: [{ type: "text", text: `echo: ${message.params.arguments.text}` }], isError: false, structuredContent: { ok: true } },
+    });
+  }
+  reply(200, { jsonrpc: "2.0", id: message.id, error: { code: -32601, message: "Method not found" } });
+}
+
+/** 读「已连接的连接器」事件流：事件名 → 各次的 data。 */
+async function connectorEvents() {
+  const stream = await requestText("claude.ai", "/api/organizations/local/mcp/v2/bootstrap", { accept: "text/event-stream" });
+  assert.equal(stream.status, 200);
+  assert.match(stream.headers["content-type"], /text\/event-stream/);
+  const events = {};
+  for (const block of stream.body.split("\n\n").filter(Boolean)) {
+    const [, name, data] = /^event: (\S+)\ndata: (.*)$/s.exec(block);
+    (events[name] ??= []).push(JSON.parse(data));
+  }
+  return events;
+}
+
 // 公开插件目录里的一条记录：插件在仓库的子目录里，带一个 skill 和一个会运行代码的钩子。
 const pluginCommit = "0123456789abcdef0123456789abcdef01234567";
 const pluginFixture = {
@@ -429,6 +517,7 @@ before(async () => {
   const gatewayPort = await listen(gateway);
   // 假上游：记录代理转发过来的 host 头与路径
   upstreamFixture = http.createServer((req, res) => {
+    if (["mcp.demo.example", "mcp.auth.example", "auth.example"].includes(req.headers.host)) return connectorFixture(req, res);
     upstreamRequests.push({ host: req.headers.host, url: req.url });
     if (req.url === "/claude-code-releases/fixture/claude.zst") {
       const first = Buffer.from([0x28, 0xb5, 0x2f, 0xfd]), last = Buffer.from("bundle");
@@ -507,6 +596,9 @@ before(async () => {
         "assets-proxy.anthropic.com": `http://127.0.0.1:${upstreamFixturePort}`,
         "api.anthropic.com": `http://127.0.0.1:${upstreamFixturePort}`,
         "codeload.github.com": `http://127.0.0.1:${upstreamFixturePort}`,
+        "mcp.demo.example": `http://127.0.0.1:${upstreamFixturePort}`,
+        "mcp.auth.example": `http://127.0.0.1:${upstreamFixturePort}`,
+        "auth.example": `http://127.0.0.1:${upstreamFixturePort}`,
       }),
       CLAUDE_LOCAL_CACHE_DIR: dictationCacheDir,
       CLAUDE_LOCAL_COWORK_PROMPT_FILE: coworkPromptFile,
@@ -690,8 +782,8 @@ test("Desktop receives the native Computer Use rollout without enabling permissi
   assert.equal(result.body.features["40173473"].value, true);
   assert.equal(result.body.features["40173473"].on, true);
   assert.equal(result.body.features["40173473"].off, false);
-  // 2340532315：账号插件的同步，见「plugins install from the public directory」。
-  assert.deepEqual(Object.keys(result.body.features).sort(), ["1291166712", "2340532315", "40173473"]);
+  // 2340532315：账号插件的同步；600735300：连接器登录在应用内完成。
+  assert.deepEqual(Object.keys(result.body.features).sort(), ["1291166712", "2340532315", "40173473", "600735300"]);
   assert.equal(result.body.chicagoEnabled, undefined);
 });
 
@@ -1118,6 +1210,158 @@ test("plugins install from the public directory: detail, enable, download, liste
   assert.equal(removed.body.enabled, false);
   assert.deepEqual((await enabledList()).body.plugins, []);
   assert.deepEqual((await get("plugins/enabled-state")).body.preferences, []);
+});
+
+test("a connector that needs no sign-in is added, shows as connected with its tools, runs them, and is removed", async () => {
+  const mcp = "/api/organizations/local/mcp";
+  const before = await connectorEvents();
+  assert.deepEqual(before.server_list[0].servers, []);
+  assert.ok(before.first_pass_complete && before.completed, "空名单也要明确结束，否则页面一直等");
+
+  const created = await request(`${mcp}/remote_servers`, {
+    host: "claude.ai",
+    body: { name: "Demo", url: "https://mcp.demo.example/mcp", mcp_directory_server_uuid: "69f3a300-cc60-48c4-b237-dfac56530dbf", user_confirmed: true },
+  });
+  assert.equal(created.status, 200);
+  const { uuid } = created.body;
+  assert.match(uuid, /^[0-9a-f-]{36}$/);
+  assert.equal(created.body.name, "Demo");
+  assert.equal(created.body.url, "https://mcp.demo.example/mcp");
+  assert.equal(created.body.mcp_directory_server_uuid, "69f3a300-cc60-48c4-b237-dfac56530dbf");
+  assert.match(created.body.created_at, /Z$/);
+  // 同一个地址再加一次：给回原来那条。
+  const again = await request(`${mcp}/remote_servers`, { host: "claude.ai", body: { name: "Demo", url: "https://mcp.demo.example/mcp" } });
+  assert.equal(again.body.uuid, uuid);
+  assert.equal(again.body.existing, true);
+  assert.equal((await request(`${mcp}/remote_servers`, { host: "claude.ai", body: { name: "Plain", url: "http://mcp.demo.example/mcp" } })).status, 400);
+
+  // 页面加完连接器总会「连接」一次：不用登录的直接算连上。
+  const started = await request(`${mcp}/start-auth/${uuid}?response_format=json&desktop_finish=claude`, { host: "claude.ai" });
+  assert.deepEqual(started.body, { connected: true });
+
+  const events = await connectorEvents();
+  assert.deepEqual(events.server_list[0].servers, [{
+    uuid, name: "Demo", url: "https://mcp.demo.example/mcp", directoryEntryUuid: "69f3a300-cc60-48c4-b237-dfac56530dbf",
+  }]);
+  const [base] = events.server_base;
+  assert.equal(base.uuid, uuid);
+  assert.equal(base.connected, true);
+  assert.equal(base.authStatus, "not_required");
+  assert.equal(base.usedAuthentication, false);
+  assert.equal(base.instructions, "Use the echo tool.");
+  assert.deepEqual(events.tools, [{
+    server_uuid: uuid,
+    tools: [{
+      name: "echo", description: "Echoes", inputSchema: { type: "object", properties: { text: { type: "string" } } },
+      annotations: { title: "Echo" }, displayName: "Echo", enabled_key: `${uuid}:echo`, always_approved_key: `${uuid}:echo:always`,
+    }],
+  }]);
+  assert.deepEqual(Object.keys(events), ["server_list", "server_base", "tools", "first_pass_complete", "completed"]);
+
+  const listed = (await request(`${mcp}/remote_servers_with_connection`, { host: "claude.ai" })).body;
+  assert.equal(listed[0].uuid, uuid);
+  assert.equal(listed[0].connection_state, "connected");
+  assert.equal(listed[0].connection_auth_type, null);
+  assert.equal((await request(`${mcp}/remote_servers/${uuid}`, { host: "claude.ai" })).body.uuid, uuid);
+  assert.equal((await request(`${mcp}/remote_servers`, { host: "claude.ai" })).body.length, 1);
+
+  // 会话里调用工具：桌面端主进程发的就是这个请求。
+  const called = await request(`${mcp}/servers/${uuid}/tools/call`, { host: "claude.ai", body: { tool_name: "echo", arguments: { text: "hi" } } });
+  assert.equal(called.status, 200);
+  assert.deepEqual(called.body, { content: [{ type: "text", text: "echo: hi" }], is_error: false, structured_content: { ok: true } });
+  assert.deepEqual(mcpFixture.calls.at(-1), { host: "mcp.demo.example", authorization: undefined, params: { name: "echo", arguments: { text: "hi" } } });
+
+  const gone = await request(`${mcp}/remote_servers/${uuid}`, { host: "claude.ai", method: "DELETE" });
+  assert.equal(gone.status, 200);
+  const after = await connectorEvents();
+  assert.deepEqual(after.server_list[0].servers, []);
+  assert.deepEqual(after.server_list[0].deleted_server_uuids, [uuid]);
+  const missing = await request(`${mcp}/servers/${uuid}/tools/call`, { host: "claude.ai", body: { tool_name: "echo", arguments: {} } });
+  assert.equal(missing.status, 404);
+  assert.equal(missing.body.error.details.error_code, "mcp_connector_removed");
+});
+
+test("a connector that needs sign-in goes through OAuth in the browser and hands the result back to the app", async () => {
+  const mcp = "/api/organizations/local/mcp";
+  const { uuid } = (await request(`${mcp}/remote_servers`, { host: "claude.ai", body: { name: "Private", url: "https://mcp.auth.example/mcp" } })).body;
+
+  const waiting = await connectorEvents();
+  assert.equal(waiting.server_base[0].connected, false);
+  assert.equal(waiting.server_base[0].authStatus, "auth_required");
+  assert.equal(waiting.tools, undefined);
+
+  // 桌面端没报 claude:// 能力（或走的是整页跳转）时，登录结果交不回应用：明确拒绝，不给会跳去真 claude.ai 的地址。
+  assert.equal((await request(`${mcp}/start-auth/${uuid}?response_format=json`, { host: "claude.ai" })).body.error.details.error_code, "mcp_sign_in_unavailable");
+  assert.equal((await request(`${mcp}/start-auth/${uuid}?browser_handoff=1&desktop_finish=claude`, { host: "claude.ai" })).status, 400);
+
+  const started = (await request(`${mcp}/start-auth/${uuid}?response_format=json&desktop_finish=claude`, { host: "claude.ai" })).body;
+  assert.equal(started.finish_in_app, true);
+  assert.match(started.state, /^[A-Za-z0-9_-]{16,256}$/);
+  const authorize = new URL(started.auth_url);
+  assert.equal(authorize.origin + authorize.pathname, "https://auth.example/authorize");
+  const redirect = `http://127.0.0.1:${proxyPort}/mcp-oauth-callback`;
+  assert.deepEqual(Object.fromEntries(authorize.searchParams), {
+    response_type: "code", client_id: "client-1", redirect_uri: redirect, state: started.state,
+    code_challenge: authorize.searchParams.get("code_challenge"), code_challenge_method: "S256",
+    resource: "https://mcp.auth.example/mcp", scope: "read write",
+  });
+  assert.deepEqual(mcpFixture.registrations.at(-1).redirect_uris, [redirect]);
+  assert.equal(mcpFixture.registrations.at(-1).token_endpoint_auth_method, "none");
+  mcpFixture.challenge = authorize.searchParams.get("code_challenge");
+
+  // 浏览器登录完跳回本机：没有本地凭据，state 不对的不认。
+  const page = (query) => fetch(`http://127.0.0.1:${proxyPort}/mcp-oauth-callback?${query}`);
+  assert.equal((await page("code=code-1&state=wrong")).status, 400);
+  const landed = await page(`code=code-1&state=${started.state}`);
+  assert.equal(landed.status, 200);
+  const link = /href="(claude:\/\/[^"]+)"/.exec(await landed.text())[1].replaceAll("&amp;", "&");
+  const handed = new URL(link);
+  assert.equal(handed.host + handed.pathname, `claude.ai/mcp-auth-callback/${uuid}`);
+  assert.equal(handed.searchParams.get("step"), "finish");
+  assert.equal(handed.searchParams.get("state"), started.state);
+  assert.equal(handed.searchParams.has("code"), false, "授权码不能出现在交回应用的链接里");
+  const ticket = handed.searchParams.get("ticket");
+  assert.match(ticket, /^[A-Za-z0-9_-]{16,256}$/);
+  assert.deepEqual(mcpFixture.tokenRequests.at(-1), {
+    grant_type: "authorization_code", code: "code-1", redirect_uri: redirect,
+    code_verifier: mcpFixture.tokenRequests.at(-1).code_verifier, client_id: "client-1", resource: "https://mcp.auth.example/mcp",
+  });
+
+  const claim = (value) => request(`/api/mcp/auth_callback?state=${started.state}&ticket=${value}&response_format=json`, { host: "claude.ai" });
+  assert.deepEqual((await claim("wrong-ticket-wrong-ticket")).body, { success: false, error_code: "mcp_auth_state_invalid" });
+  assert.deepEqual((await claim(ticket)).body, { success: true });
+  assert.deepEqual((await claim(ticket)).body, { replayed: true });
+
+  const signedIn = await connectorEvents();
+  const base = signedIn.server_base.find((entry) => entry.uuid === uuid);
+  assert.equal(base.connected, true);
+  assert.equal(base.authStatus, "authenticated");
+  assert.equal(base.usedAuthentication, true);
+  assert.equal(signedIn.tools.find((entry) => entry.server_uuid === uuid).tools[0].name, "echo");
+  assert.equal((await request(`${mcp}/remote_servers/${uuid}`, { host: "claude.ai" })).body.is_authenticated, true);
+
+  const call = () => request(`${mcp}/servers/${uuid}/tools/call`, { host: "claude.ai", body: { tool_name: "echo", arguments: { text: "secret" } } });
+  assert.equal((await call()).body.content[0].text, "echo: secret");
+  assert.equal(mcpFixture.calls.at(-1).authorization, "Bearer token-1");
+  // 令牌过期：用刷新令牌换一个新的，这次调用照常完成。
+  mcpFixture.validTokens.delete("token-1");
+  assert.equal((await call()).body.content[0].text, "echo: secret");
+  assert.equal(mcpFixture.calls.at(-1).authorization, "Bearer token-2");
+  assert.equal(mcpFixture.tokenRequests.at(-1).grant_type, "refresh_token");
+  // 刷新也不行了：调用失败成一条模型看得懂的工具结果，状态变成要重新登录。
+  mcpFixture.validTokens.clear();
+  mcpFixture.refreshes = false;
+  const expired = (await call()).body;
+  assert.equal(expired.is_error, true);
+  assert.match(expired.content[0].text, /sign in again/);
+  assert.equal((await connectorEvents()).server_base.find((entry) => entry.uuid === uuid).authStatus, "token_invalid");
+
+  // 断开：令牌丢掉，显示为未连接。
+  assert.equal((await request(`${mcp}/logout/${uuid}`, { host: "claude.ai", method: "POST" })).status, 200);
+  const loggedOut = await connectorEvents();
+  assert.equal(loggedOut.server_base.find((entry) => entry.uuid === uuid).authStatus, "auth_required");
+  assert.equal((await request(`${mcp}/remote_servers/${uuid}`, { host: "claude.ai" })).body.is_authenticated, false);
+  await request(`${mcp}/remote_servers/${uuid}`, { host: "claude.ai", method: "DELETE" });
 });
 
 test("frame type catalog and plugin registry return validated list shapes", async () => {

@@ -41,6 +41,7 @@ pub fn run() {
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
+        .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
             install_tray(app)?;
             if let Some(window) = app.get_webview_window(MAIN_WINDOW) {
@@ -61,6 +62,11 @@ pub fn run() {
             commands::claude_local_status,
             commands::claude_local_configure,
             commands::claude_local_action,
+            commands::claude_local_extensions,
+            commands::claude_local_extension_enable,
+            commands::claude_local_extension_import,
+            commands::claude_local_extension_remove,
+            commands::claude_local_extension_open_folder,
             commands::claude_mom_load,
             commands::claude_mom_save_profile,
             commands::claude_mom_delete_profile,

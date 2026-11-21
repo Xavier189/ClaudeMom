@@ -230,6 +230,69 @@ pub async fn claude_local_action(action: String) -> CommandResult<Value> {
     }
 }
 
+// ── 页面扩展 ─────────────────────────────────────────────────────────────
+
+#[derive(Debug, Serialize)]
+pub struct ExtensionsPayload {
+    extensions: Vec<claude_local::extensions::ExtensionInfo>,
+}
+
+fn extensions_payload() -> ExtensionsPayload {
+    ExtensionsPayload { extensions: claude_local::extensions::list() }
+}
+
+const REFRESH_HINT: &str = "刷新 Claude 页面（Cmd/Ctrl+R）生效。";
+
+#[tauri::command]
+pub fn claude_local_extensions() -> CommandResult<ExtensionsPayload> {
+    ok("", extensions_payload())
+}
+
+#[tauri::command]
+pub fn claude_local_extension_enable(id: String, enabled: bool) -> CommandResult<ExtensionsPayload> {
+    match claude_local::extensions::set_enabled(&id, enabled) {
+        Ok(extensions) => {
+            let name = extensions.iter().find(|item| item.id == id).map_or(id.as_str(), |item| item.name.as_str());
+            let message = format!("已{}「{name}」，{REFRESH_HINT}", if enabled { "启用" } else { "停用" });
+            ok(&message, ExtensionsPayload { extensions })
+        }
+        Err(error) => failed(&format!("{error:#}"), extensions_payload()),
+    }
+}
+
+#[tauri::command]
+pub async fn claude_local_extension_import(path: String) -> CommandResult<ExtensionsPayload> {
+    let result = tauri::async_runtime::spawn_blocking(move || claude_local::extensions::import(std::path::Path::new(&path))).await;
+    match result {
+        Ok(Ok(imported)) => {
+            let manifest = &imported.manifest;
+            let message = match imported.replaced {
+                Some(old) => format!("已把「{}」从 {old} 更新到 {}。{REFRESH_HINT}", manifest.name, manifest.version),
+                None => format!("已导入「{}」{}，打开开关后{REFRESH_HINT}", manifest.name, manifest.version),
+            };
+            ok(&message, extensions_payload())
+        }
+        Ok(Err(error)) => failed(&format!("导入失败：{error:#}"), extensions_payload()),
+        Err(error) => failed(&format!("导入失败：{error}"), extensions_payload()),
+    }
+}
+
+#[tauri::command]
+pub fn claude_local_extension_remove(id: String) -> CommandResult<ExtensionsPayload> {
+    match claude_local::extensions::remove(&id) {
+        Ok(name) => ok(&format!("已删除「{name}」，{REFRESH_HINT}"), extensions_payload()),
+        Err(error) => failed(&format!("{error:#}"), extensions_payload()),
+    }
+}
+
+#[tauri::command]
+pub fn claude_local_extension_open_folder() -> CommandResult<ExtensionsPayload> {
+    match claude_local::extensions::open_folder() {
+        Ok(()) => ok("", extensions_payload()),
+        Err(error) => failed(&format!("{error:#}"), extensions_payload()),
+    }
+}
+
 // ── 本地听写模型 ─────────────────────────────────────────────────────────
 
 #[tauri::command]
