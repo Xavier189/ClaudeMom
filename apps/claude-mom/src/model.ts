@@ -62,6 +62,19 @@ export type ClaudeConfig = {
   importCliSessions?: boolean;
 };
 
+/** 页面扩展（与 core `extensions::ExtensionInfo` 一致）。 */
+export type ExtensionInfo = {
+  id: string;
+  name: string;
+  version: string;
+  author: string;
+  description: string;
+  builtin: boolean;
+  enabled: boolean;
+  /** 清单有问题时的原因：这样的扩展不会生效，也不能启用。 */
+  error: string | null;
+};
+
 export type ClaudeStatus = {
   supported: boolean;
   sourceApp: string;

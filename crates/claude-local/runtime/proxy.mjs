@@ -25,10 +25,12 @@ import crypto from "node:crypto";
 import { Duplex } from "node:stream";
 import zlib from "node:zlib";
 import { fileURLToPath } from "node:url";
+import { ConnectorError, connectorRecord, createConnectorService } from "./connectors.mjs";
 import { createConversationService } from "./conversation-service.mjs";
 import { isPatchedStartupAsset, startupAssets } from "./scripts/patch-dictation-start.mjs";
-import { createGatewayStreamParser, createStateStore, gatewayBody, gatewayHttpError, gatewayModel, gatewayTarget, isPrivateFile, mergePoolModels, modelList, modelSelectors, modelWindow, normalizeCurrentUserAccess, planProfile, runtimeConfig } from "./runtime.mjs";
+import { createGatewayStreamParser, createStateStore, gatewayBody, gatewayHttpError, gatewayModel, gatewayTarget, isLocalNetworkHost, isPrivateFile, mergePoolModels, modelList, modelSelectors, modelWindow, normalizeCurrentUserAccess, planProfile, runtimeConfig } from "./runtime.mjs";
 import { createOfficialAssets, loadCoworkSystemPrompt } from "./official-assets.mjs";
+import { EXTENSION_PREFIX, createExtensions } from "./extensions.mjs";
 import { DIRECTORY_MARKETPLACE, installablePlugin, installedDirectoryRecord, libraryItem, pluginRecord, pluginRepository, zipSubtree } from "./plugins.mjs";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -84,6 +86,35 @@ function addLocalizationShim(html, officialLocales) {
 const officialShell = runtime.managed
   ? addLocalizationShim(officialAssets.indexHtml, officialAssets.i18nLocales)
   : null;
+
+// 页面扩展（见 extensions.mjs）：启用中的扩展的 js / css 以同源地址插进页面外壳，每次请求现读。
+const extensions = runtime.managed && runtime.extensionDirs.length && runtime.extensionsState
+  ? createExtensions({ dirs: runtime.extensionDirs.map((dir) => path.resolve(dir)), stateFile: runtime.extensionsState })
+  : null;
+
+// 插在官方脚本之前（有本地化 shim 时在它之后），这样扩展能赶在页面脚本前做事（比如包一层 fetch）。
+// 页面脚本带 nonce 时抄给我们的标签：线上外壳的 CSP 按 nonce 放行脚本。
+function addExtensions(body) {
+  const assets = extensions?.assets() ?? [];
+  if (!assets.length) return body;
+  const html = Buffer.isBuffer(body) ? body.toString("utf8") : body;
+  const head = /<head\b[^>]*>/i.exec(html);
+  const headEnd = /<\/head\s*>/i.exec(html);
+  if (!head || !headEnd || head.index >= headEnd.index) return body;
+  const nonce = /<script\b[^>]*\bnonce=(["'])([\w+/=-]+)\1/i.exec(html)?.[2];
+  const nonceAttr = nonce ? ` nonce="${nonce}"` : "";
+  const tags = assets.map(({ type, href }) => type === "style"
+    ? `<link rel="stylesheet" href="${href}"${nonceAttr}>`
+    : `<script src="${href}"${nonceAttr}></script>`).join("");
+  const contentStart = head.index + head[0].length;
+  const headContent = html.slice(contentStart, headEnd.index);
+  const shimTag = `<script src="${LOCALIZATION_SHIM_PATH}"></script>`;
+  const shimAt = headContent.indexOf(shimTag);
+  const firstScript = /<script\b/i.exec(headContent);
+  const insertAt = contentStart + (shimAt !== -1 ? shimAt + shimTag.length
+    : firstScript ? firstScript.index : headContent.length);
+  return Buffer.from(`${html.slice(0, insertAt)}${tags}${html.slice(insertAt)}`);
+}
 const args = process.argv.slice(2);
 const arg = (name, fallback) => {
   const i = args.indexOf(`--${name}`);
@@ -502,11 +533,12 @@ function noteClient() {
 const CONV_STATE = new Map();
 const NOTIFICATION_SETTINGS = new Map();
 const INSTALLED_PLUGINS = new Map(); // 插件 id → 安装时的目录记录
+const CONNECTORS = new Map(); // 连接器 uuid → 记录（见 connectors.mjs）
 let DEVICE_ROW = null; // Code 模式注册的设备行 {id, k, ...}
 const stateStore = createStateStore(STATE_FILE, CONV_STATE, NOTIFICATION_SETTINGS, (warning) => {
   persistenceWarning = warning;
   console.error(warning);
-}, INSTALLED_PLUGINS);
+}, INSTALLED_PLUGINS, CONNECTORS);
 
 function ensureConv(uuid) {
   if (!CONV_STATE.has(uuid)) {
@@ -534,6 +566,7 @@ const conversationService = createConversationService({
   listConvs: () => [...CONV_STATE.values()],
   log,
   onChange: (flush) => flush ? stateStore.flush() : stateStore.changed(),
+  request: (target, options, callback) => gatewayRequest(target, options, callback),
 });
 
 function pushMessage(conv, msg) {
@@ -788,6 +821,17 @@ function useClassicHome(result, template) {
   }
 }
 
+// 连接器登录在应用内完成，页面这一侧的开关（桌面端那一侧是 /api/desktop/features 里的 600735300）。
+// 较早的录制版本里没有这一项。
+const CONNECTOR_SIGN_IN_FEATURE_ID = "1286103945";
+function allowConnectorSignIn(result, template) {
+  if (!template?.org_growthbook?.features || !result.org_growthbook?.features) return;
+  result.org_growthbook = {
+    ...result.org_growthbook,
+    features: { ...result.org_growthbook.features, [CONNECTOR_SIGN_IN_FEATURE_ID]: { defaultValue: true } },
+  };
+}
+
 let resolvedBootstrapCache;
 // 主页问候语里带着称呼：模板里是「Local User」（脱敏时换的），按设置里的用户名换掉。
 const TEMPLATE_DISPLAY_NAME = "Local User";
@@ -823,6 +867,7 @@ function resolvedBootstrap() {
   enableLocalThemeRenderer(result);
   result.current_user_access = normalizeCurrentUserAccess(result.current_user_access, runtime);
   if (!runtime.hubHome) useClassicHome(result, template);
+  allowConnectorSignIn(result, template);
   if (useOfficialShell) {
     // 模板里的 gated_imports 是录制时线上版本的分块清单，与本机外壳对不上：换成本机版本。
     result.gated_imports = {};
@@ -960,7 +1005,8 @@ function generateSessionTitle(rawText, requestedModel, emptyFallback, callback) 
     settled = true;
     callback(title || fallback);
   };
-  const greq = (target.protocol === "https:" ? https : http).request(
+  const greq = gatewayRequest(
+    target,
     {
       hostname: target.hostname,
       port: target.port || (target.protocol === "https:" ? 443 : 80),
@@ -1115,6 +1161,8 @@ function forcedDesktopFeature(value) {
       "40173473": forcedDesktopFeature(runtime.computerUse),
       // 账号插件的同步：关着时桌面端不读已装列表、不下载插件、会话里也不挂载（见 pluginApi）。
       "2340532315": forcedDesktopFeature(true),
+      // 连接器登录在应用内完成（见 connectors.mjs）：关着时桌面端不报这个能力，页面会改走经过真 claude.ai 的登录。
+      "600735300": forcedDesktopFeature(true),
     };
     features["1291166712"].on = runtime.computerUse;
     features["1291166712"].off = !runtime.computerUse;
@@ -1211,6 +1259,7 @@ function forcedDesktopFeature(value) {
     return json(res, { checked: [] });
   }
   if (pluginApi(req, res, url, p)) return;
+  if (connectorApi(req, res, url, p)) return;
 
   // 分页/列表类接口：客户端会 flatMap 取 .items/.data，回 {} 会出 [undefined] 元素
   // → render 时 TypeError 进 fatal boundary（0NV6PUA 崩溃页的来源）
@@ -1238,7 +1287,7 @@ function forcedDesktopFeature(value) {
   // 否则 EventSource 收到 application/json 会中断连接，Code 面板永远停在骨架屏。
   const wantsSse = req.headers.accept?.includes("text/event-stream");
   if (p === "/v1/code/sessions/watch" || p.startsWith("/v1/code/sessions/watch") ||
-      (wantsSse && (/^\/v1\//.test(p) || /\/mcp\/v2\/bootstrap$/.test(p)))) {
+      (wantsSse && /^\/v1\//.test(p))) {
     res.writeHead(200, {
       "content-type": "text/event-stream",
       "cache-control": "no-store",
@@ -1547,7 +1596,8 @@ function forcedDesktopFeature(value) {
         })) : [{ role: "user", content: prompt }],
       });
       const target = gatewayTarget(runtime, "/v1/messages");
-      const greq = (target.protocol === "https:" ? https : http).request(
+      const greq = gatewayRequest(
+        target,
         {
           hostname: target.hostname,
           port: target.port || (target.protocol === "https:" ? 443 : 80),
@@ -1746,8 +1796,9 @@ function readDocShell(host) {
 // 绝不回放登出落地页桩体——那会让 SPA 永远卡在骨架屏。
 function serveDocShell(req, res, url) {
   const host = url.host || "claude.ai";
-  const cached = readDocShell(host);
-  if (cached) {
+  const shell = readDocShell(host);
+  if (shell) {
+    const cached = addExtensions(shell);
     res.writeHead(200, {
       "content-type": "text/html; charset=utf-8",
       "content-length": cached.length,
@@ -1783,11 +1834,12 @@ function serveDocShell(req, res, url) {
             JSON.stringify({ status: 200, headers: { "content-type": "text/html" }, url: `${host}/epitaxy` }),
           );
         }
+        const page = r.statusCode === 200 && !r.headers["content-encoding"] ? addExtensions(body) : body;
         res.writeHead(r.statusCode || 502, {
           "content-type": "text/html; charset=utf-8",
-          "content-length": body.length,
+          "content-length": page.length,
         });
-        res.end(body);
+        res.end(page);
       });
     },
   );
@@ -1812,7 +1864,7 @@ function forwardGateway(req, res, requestPath, raw) {
     "x-api-key": runtime.key, authorization: `Bearer ${runtime.key}`,
   };
   for (const key of ["proxy-connection", "accept-encoding", "connection", "cookie", "transfer-encoding"]) delete headers[key];
-  const up = (target.protocol === "https:" ? https : http).request({
+  const up = gatewayRequest(target, {
     hostname: target.hostname, port: target.port || (target.protocol === "https:" ? 443 : 80),
     path: target.pathname + target.search, method: req.method, headers, timeout: 300000,
   }, (response) => {
@@ -1953,6 +2005,30 @@ function upstreamRequest(target, options, callback) {
   return https.request({ ...options, agent: viaProxy ? tunnelAgent : directAgent }, callback);
 }
 
+// 模型请求经出站代理时用自己的隧道连接池，不设并发上限：并行的子任务会同时开很多条流，
+// 和网页资源共用每个主机 16 条的池子会排队。
+const gatewayTunnelAgent = UPSTREAM_PROXY ? new UpstreamTunnelAgent({ keepAlive: true }) : null;
+
+/**
+ * 发往模型网关（用户配置的上游）的请求。配置了出站代理、上游又在公网上时经代理走：
+ * 只开系统代理（没开 TUN）时直连会被上游按地区拒绝。其余情况和以前一样直连。
+ */
+function gatewayRequest(target, options, callback) {
+  if (!UPSTREAM_PROXY || isLocalNetworkHost(target.hostname)) {
+    return (target.protocol === "https:" ? https : http).request(options, callback);
+  }
+  if (target.protocol === "https:") return https.request({ ...options, agent: gatewayTunnelAgent }, callback);
+  // 明文 http 的上游：按转发代理的写法，请求行里给完整地址。
+  return http.request({
+    ...options,
+    host: UPSTREAM_PROXY.hostname,
+    hostname: UPSTREAM_PROXY.hostname,
+    port: Number(UPSTREAM_PROXY.port || 80),
+    path: target.href,
+    headers: { host: target.host, ...options.headers, ...upstreamProxyAuth() },
+  }, callback);
+}
+
 function upstreamFailureHeaders(req) {
   const result = {
     "content-type": "text/plain; charset=utf-8",
@@ -1966,6 +2042,12 @@ function upstreamFailureHeaders(req) {
     result["access-control-allow-credentials"] = "true";
   }
   return result;
+}
+
+/** 能原样改写的页面：200、HTML、未压缩。 */
+function isHtmlResponse(status, headers) {
+  return status === 200 && /^text\/html\b/i.test(String(headers?.["content-type"] || "")) &&
+    !headers["content-encoding"];
 }
 
 function proxyUpstream(req, res, url) {
@@ -2026,8 +2108,10 @@ function proxyUpstream(req, res, url) {
             JSON.stringify({ status: up.statusCode, headers: bufferedResponseHeaders(up.headers, body.length), url: cacheKey }),
           );
         }
-        res.writeHead(up.statusCode, bufferedResponseHeaders(up.headers, body.length));
-        res.end(body);
+        // 缓存里存原文，注入只改这次返回的页面。
+        const page = document && isHtmlResponse(up.statusCode, up.headers) ? addExtensions(body) : body;
+        res.writeHead(up.statusCode, bufferedResponseHeaders(up.headers, page.length));
+        res.end(page);
       });
     },
   );
@@ -2050,8 +2134,9 @@ function proxyUpstream(req, res, url) {
         res.end("upstream unavailable (doc stub suppressed)\n");
         return;
       }
-      res.writeHead(meta.status || 200, bufferedResponseHeaders(meta.headers, body.length));
-      res.end(body);
+      const page = isHtmlResponse(meta.status, meta.headers) ? addExtensions(body) : body;
+      res.writeHead(meta.status || 200, bufferedResponseHeaders(meta.headers, page.length));
+      res.end(page);
       log(`CACHE HIT ${url.pathname}`);
       return;
     }
@@ -2096,37 +2181,52 @@ function publicPluginDirectory(req, res, url) {
   upstreamReq.end();
 }
 
-/** 读完一个上游地址的整个响应体，超过 `limit` 字节就放弃。 */
-function fetchUpstream(address, limit) {
+/**
+ * 向一个上游地址发请求，读完整个响应体（超过 `limit` 字节放弃）。
+ * `until(正文)`：返回真时不等对方结束连接就交回，SSE 形式的回复用。
+ */
+function upstreamCall(address, { method = "GET", headers = {}, body, limit = 8 * 1024 * 1024, timeout = 30000, until } = {}) {
   return new Promise((resolve, reject) => {
     const url = new URL(address);
     const target = new URL(url.pathname + url.search, UPSTREAM_MAP[url.host] || url.origin);
+    const payload = body === undefined ? undefined : Buffer.from(body);
     const request = upstreamRequest(
       target,
       {
         hostname: target.hostname,
         port: target.port || 443,
         path: target.pathname + target.search,
-        headers: { host: url.host, accept: "*/*", "user-agent": "claude-local" },
-        timeout: 30000,
+        method,
+        headers: {
+          accept: "*/*", "user-agent": "claude-local", ...headers, host: url.host,
+          ...(payload ? { "content-length": payload.length } : {}),
+        },
+        timeout,
       },
       (response) => {
         const chunks = [];
         let size = 0;
+        const done = () => resolve({ status: response.statusCode, headers: response.headers, body: Buffer.concat(chunks) });
         response.on("data", (chunk) => {
           size += chunk.length;
           if (size > limit) return request.destroy(new Error("upstream response too large"));
           chunks.push(chunk);
+          if (until?.(Buffer.concat(chunks).toString("utf8"))) {
+            done();
+            request.destroy();
+          }
         });
-        response.on("end", () => resolve({ status: response.statusCode, body: Buffer.concat(chunks) }));
+        response.on("end", done);
         response.on("error", reject);
       },
     );
     request.on("timeout", () => request.destroy(new Error("upstream timeout")));
     request.on("error", reject);
-    request.end();
+    request.end(payload);
   });
 }
+
+const fetchUpstream = (address, limit) => upstreamCall(address, { limit });
 
 const PLUGIN_DIRECTORY_URL = "https://api.anthropic.com/api/directory/plugins";
 const PLUGIN_LOOKUP_TTL_MS = 10 * 60_000;
@@ -2161,6 +2261,165 @@ function directoryPluginByName(name) {
   if (!/^[\w.-]{1,128}$/.test(name)) return null;
   const filter = `manifest_name == '${name}' && source.marketplace_slug == '${DIRECTORY_MARKETPLACE.name}'`;
   return directoryPlugin(`name:${name}`, `${PLUGIN_DIRECTORY_URL}?limit=1&filter=${encodeURIComponent(filter)}`);
+}
+
+const connectorService = createConnectorService({
+  connectors: CONNECTORS,
+  send: upstreamCall,
+  changed: () => stateStore.flush(),
+  redirectUri: () => `http://127.0.0.1:${listeningPort}${CONNECTOR_SIGN_IN_PATH}`,
+});
+
+/**
+ * 账号侧的连接器接口（见 connectors.mjs）：添加 / 列出 / 移除、连接和登录、状态事件流、会话里的工具调用。
+ * 处理了返回 true。
+ */
+function connectorApi(req, res, url, p) {
+  const method = req.method;
+  const fail = (error) => {
+    if (res.headersSent) return res.destroy();
+    const known = error instanceof ConnectorError;
+    json(res, {
+      type: "error",
+      error: {
+        type: known ? "invalid_request_error" : "api_error",
+        message: known ? error.message : "Connector request failed",
+        details: { error_code: known ? error.code : "mcp_request_failed" },
+      },
+    }, known ? error.status : 502);
+  };
+  const answer = (work) => {
+    Promise.resolve().then(work).then((value) => { if (value !== undefined) json(res, value); }).catch(fail);
+    return true;
+  };
+  const withBody = (work) => {
+    readBody(req, (raw) => answer(() => work(decodeJsonBody(req, raw))));
+    return true;
+  };
+
+  // 页面拿登录结果（不带组织）。
+  if (method === "GET" && p === "/api/mcp/auth_callback") {
+    return answer(() => connectorService.claim(url.searchParams.get("state") ?? "", url.searchParams.get("ticket") ?? ""));
+  }
+  const route = /^\/api\/organizations\/[^/]+\/mcp\/(.+)$/.exec(p)?.[1];
+  if (!route) return false;
+
+  if (method === "GET" && route === "v2/bootstrap") {
+    res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-store" });
+    const write = (event, data) => { if (!res.writableEnded) res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`); };
+    connectorService.stream(write).catch(() => {}).finally(() => res.end());
+    return true;
+  }
+  if (method === "GET" && route === "remote_servers_with_connection") {
+    return answer(() => connectorService.list().map((connector) => ({
+      ...connectorRecord(connector),
+      connection_state: connector.disconnected ? "user_disconnected" : connectorService.connected(connector) ? "connected" : null,
+      connection_auth_type: null,
+    })));
+  }
+  if (route === "remote_servers") {
+    if (method === "GET") return answer(() => connectorService.list().map(connectorRecord));
+    if (method === "POST") {
+      return withBody((body) => {
+        const { connector, existing } = connectorService.create({
+          name: body.name, url: body.url, directoryUuid: body.mcp_directory_server_uuid ?? body.install?.mcp_directory_server_uuid,
+        });
+        return { ...connectorRecord(connector), ...(existing ? { existing: true } : {}) };
+      });
+    }
+    return false;
+  }
+  if (method === "POST" && route === "desktop_finish/wait_ended") return answer(() => ({}));
+  // 连接表单（要用户填地址或密钥的连接器）没有数据来源；404 时页面直接走普通的添加。
+  if (method === "GET" && /^directory_servers\/[^/]+\/install_form$/.test(route)) {
+    return answer(() => { throw new ConnectorError("not_found", "No install form", 404); });
+  }
+
+  const target = /^(remote_servers|logout|start-auth|servers)\/([0-9a-f-]{36})(?:\/(.+))?$/.exec(route);
+  if (!target) return false;
+  const [, kind, uuid, rest] = target;
+  const connector = connectorService.get(uuid);
+  if (!connector) {
+    return answer(() => { throw new ConnectorError("mcp_connector_removed", "This connector was removed.", 404); });
+  }
+
+  if (kind === "remote_servers" && rest === undefined) {
+    if (method === "GET") return answer(() => connectorRecord(connector));
+    if (method === "PUT") {
+      return withBody((body) => {
+        connectorService.rename(connector, body.name);
+        return connectorRecord(connector);
+      });
+    }
+    if (method === "DELETE") {
+      return answer(() => {
+        connectorService.remove(uuid);
+        return {};
+      });
+    }
+    return false;
+  }
+  if (kind === "remote_servers" && method === "POST" && rest === "clear_cache") {
+    return answer(() => {
+      connectorService.refreshStatus(connector);
+      return {};
+    });
+  }
+  // 逐个工具的权限设置：本地不做，空对象在页面里是「没有清单」。
+  if (kind === "remote_servers" && method === "GET" && rest === "tools") return answer(() => ({}));
+  if (kind === "logout" && method === "POST" && rest === undefined) {
+    return answer(() => {
+      connectorService.logout(connector);
+      return {};
+    });
+  }
+  if (kind === "start-auth" && method === "GET" && rest === undefined) {
+    return answer(() => {
+      // 不带 response_format=json 的是整页跳转式登录，目的地在真正的 claude.ai 上，本地接不住。
+      if (url.searchParams.get("response_format") !== "json") {
+        throw new ConnectorError("mcp_sign_in_unavailable", "This sign-in route is not available locally.");
+      }
+      return connectorService.startAuth(connector, url.searchParams.get("desktop_finish") ?? "");
+    });
+  }
+  if (kind === "servers" && method === "POST" && rest === "tools/call") {
+    return withBody((body) => connectorService.callTool(connector, String(body.tool_name ?? ""), body.arguments));
+  }
+  if (kind === "servers" && method === "GET" && rest === "resources/list") return answer(() => ({ resources: [] }));
+  if (kind === "servers" && method === "POST" && rest === "resources/read") return answer(() => ({ contents: [] }));
+  return false;
+}
+
+const CONNECTOR_SIGN_IN_PATH = "/mcp-oauth-callback";
+
+/** 浏览器登录完跳回来的本机页面：换好令牌后把人送回 Claude。 */
+function connectorSignInCallback(res, url) {
+  const page = (status, title, detail, link) => {
+    const escape = (text) => String(text).replace(/[&<>"]/g, (char) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[char]);
+    const body = `<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">` +
+      `<title>${escape(title)}</title>` +
+      (link ? `<meta http-equiv="refresh" content="0;url=${escape(link)}">` : "") +
+      `<body style="font: 16px system-ui; max-width: 28rem; margin: 20vh auto; padding: 0 1rem; text-align: center">` +
+      `<h1 style="font-size: 1.25rem">${escape(title)}</h1><p>${escape(detail)}</p>` +
+      (link ? `<p><a href="${escape(link)}">${escape(runtime.localization ? "回到 Claude" : "Back to Claude")}</a></p>` : "");
+    res.writeHead(status, {
+      "content-type": "text/html; charset=utf-8", "content-length": Buffer.byteLength(body),
+      "cache-control": "no-store", "x-content-type-options": "nosniff", "referrer-policy": "no-referrer",
+    });
+    res.end(body);
+  };
+  const zh = runtime.localization;
+  connectorService.finishAuth({
+    state: url.searchParams.get("state") ?? "", code: url.searchParams.get("code"), error: url.searchParams.get("error"),
+  }).then((result) => {
+    if (!result) {
+      return page(400, zh ? "登录已失效" : "Sign-in expired", zh ? "请回到 Claude，重新点一次「连接」。" : "Go back to Claude and choose Connect again.");
+    }
+    if (result.success) {
+      return page(200, zh ? `已登录 ${result.name}` : `Signed in to ${result.name}`, zh ? "正在回到 Claude…" : "Returning to Claude…", result.link);
+    }
+    page(200, zh ? `没能登录 ${result.name}` : `Could not sign in to ${result.name}`, zh ? "正在回到 Claude…" : "Returning to Claude…", result.link);
+  }).catch(() => page(502, zh ? "登录出错" : "Sign-in failed", zh ? "请回到 Claude 再试一次。" : "Go back to Claude and try again."));
 }
 
 /**
@@ -2205,11 +2464,38 @@ function pluginApi(req, res, url, p) {
     json(res, { items: installed().map(libraryItem), next_cursor: null });
     return true;
   }
-  // 合并式插件页的「您的插件」读的是组织目录里状态为已启用 / 已停用的记录。
-  if (method === "GET" && route === "directory/plugins" &&
-      /installation\.state in \[[^\]]*'enabled'/.test(url.searchParams.get("filter") ?? "")) {
-    json(res, { ...EMPTY_PLUGIN_DIRECTORY, data: installed().map(installedDirectoryRecord) });
-    return true;
+  // 组织目录：合并式插件页的「您的插件」、搜索、连接器详情页（按 id 查）都读它。
+  if (method === "GET" && route === "directory/plugins") {
+    const filter = url.searchParams.get("filter") ?? "";
+    const wanted = (url.searchParams.get("q") ?? "").trim().toLowerCase();
+    // 「您的插件」：状态为已启用 / 已停用的记录，搜索时再按名字筛。
+    if (/^\(?installation\.state in \[/.test(filter)) {
+      const matches = (entry) => !wanted ||
+        [entry.name, entry.slug, entry.summary, entry.publisher?.name].some((text) => String(text ?? "").toLowerCase().includes(wanted));
+      json(res, { ...EMPTY_PLUGIN_DIRECTORY, data: installed().filter(matches).map(installedDirectoryRecord) });
+      return true;
+    }
+    // 其余的查询里只接搜索和按 id 查，原样问公开目录；别的（首页各栏）页面自己会读公开目录，这里留空。
+    if (!wanted && !/^id in \[/.test(filter)) return false;
+    return answer(async () => {
+      // 公开目录不认登录后才有的 include（installation.*），带着会被 400 拒绝。
+      const query = new URLSearchParams(url.searchParams);
+      const include = (query.get("include") ?? "").split(",").filter((part) => part && !part.startsWith("installation"));
+      if (include.length) query.set("include", include.join(","));
+      else query.delete("include");
+      const { status, body } = await fetchUpstream(`${PLUGIN_DIRECTORY_URL}?${query}`, 4 * 1024 * 1024);
+      const page = status === 200 ? JSON.parse(body.toString("utf8")) : EMPTY_PLUGIN_DIRECTORY;
+      // 公开目录里每条都是「未登录」：已装的换成已启用（查询要求没装的时去掉），其余换成未安装。
+      const rows = (Array.isArray(page.data) ? page.data : [])
+        .filter((row) => !(filter.startsWith("!(installation.state in [") && INSTALLED_PLUGINS.has(row?.id)));
+      json(res, {
+        ...page,
+        data: rows.map((row) => (INSTALLED_PLUGINS.has(row?.id) ? installedDirectoryRecord(row) : {
+          ...row,
+          installation: { state: "not_installed", actions: { install: true }, admin_policy: { type: "set", install_mode: "optional" } },
+        })),
+      });
+    });
   }
   if (method === "GET" && route === "plugins/enabled-state") {
     json(res, {
@@ -2293,6 +2579,18 @@ function handle(req, res, hostHeader) {
     return mockApi(req, res, url);
   }
   if (runtime.managed && isMainClaudeHost && url.pathname.startsWith("/__codex_plus/")) {
+    const asset = extensions && ["GET", "HEAD"].includes(req.method) && url.pathname.startsWith(EXTENSION_PREFIX)
+      ? extensions.read(url.pathname.slice(EXTENSION_PREFIX.length))
+      : null;
+    if (asset) {
+      res.writeHead(200, {
+        "content-type": asset.type,
+        "content-length": asset.body.length,
+        "cache-control": "no-store",
+        "x-content-type-options": "nosniff",
+      });
+      return res.end(req.method === "HEAD" ? undefined : asset.body);
+    }
     if (
       url.pathname !== LOCALIZATION_SHIM_PATH ||
       !localizationShim ||
@@ -2401,12 +2699,13 @@ function handle(req, res, hostHeader) {
     !path.extname(url.pathname) &&
     !/^\/(?:api|edge-api|v1|claudeai-rpc)(?:\/|$)/.test(url.pathname)
   ) {
+    const shell = addExtensions(officialShell);
     res.writeHead(200, {
       "content-type": "text/html; charset=utf-8",
-      "content-length": Buffer.byteLength(officialShell),
+      "content-length": Buffer.byteLength(shell),
       "cache-control": "no-cache",
     });
-    return res.end(officialShell);
+    return res.end(shell);
   }
 
   if (
@@ -2593,13 +2892,14 @@ function handle(req, res, hostHeader) {
     !path.extname(url.pathname) &&
     !/^\/(?:api|edge-api|v1|claudeai-rpc)(?:\/|$)/.test(url.pathname)
   ) {
+    const shell = addExtensions(TEMPLATE_SHELL);
     res.writeHead(200, {
       "content-type": "text/html; charset=utf-8",
-      "content-length": TEMPLATE_SHELL.length,
+      "content-length": shell.length,
       "cache-control": "no-store",
       ...(url.pathname === "/new" ? { "set-cookie": activeOrgCookies() } : {}),
     });
-    return res.end(TEMPLATE_SHELL);
+    return res.end(shell);
   }
   if (MODE === "mock" && url.pathname === "/new") {
     const key = crypto.createHash("sha1").update("claude.ai/login").digest("hex");
@@ -2653,9 +2953,10 @@ function handle(req, res, hostHeader) {
     const docNav = isDocNav(req, url);
     if (fs.existsSync(cp) && fs.existsSync(`${cp}.json`)) {
       const meta = JSON.parse(fs.readFileSync(`${cp}.json`, "utf8"));
-      const body = fs.readFileSync(cp);
+      const cached = fs.readFileSync(cp);
       // 文档导航只允许真外壳通过；桩体/重定向（登出落地页）改走外壳兜底
-      if (!docNav || (meta.status === 200 && body.length >= 4096)) {
+      if (!docNav || (meta.status === 200 && cached.length >= 4096)) {
+        const body = docNav && !meta.headers?.["content-encoding"] ? addExtensions(cached) : cached;
         res.writeHead(meta.status && meta.status < 400 ? 200 : meta.status, {
           ...meta.headers,
           "content-length": body.length,
@@ -2900,6 +3201,8 @@ inner.on("upgrade", handleDictationUpgrade);
 // 剥掉桌面端多发、上游网关不认的字段后转给本地 magpie。
 const outer = http.createServer((req, res) => {
   const u = new URL(req.url, `http://${req.headers.host || "127.0.0.1"}`);
+  // 连接器登录的回调是浏览器直接打开的，带不了本地凭据：凭的是登录开始时发出去的随机 state。
+  if (req.method === "GET" && u.pathname === CONNECTOR_SIGN_IN_PATH) return connectorSignInCallback(res, u);
   if (runtime.managed && req.headers.origin !== undefined) return json(res, { error: "Browser origins are not allowed" }, 403);
   if (req.method === "GET" && u.pathname === "/__codex_claude_local/health") return json(res, health());
   if (runtime.managed) {
@@ -3059,6 +3362,7 @@ function shutdown() {
   stateStore.flush();
   directAgent.destroy();
   tunnelAgent?.destroy();
+  gatewayTunnelAgent?.destroy();
   outer.close(() => process.exit(0));
   for (const socket of clientSockets) socket.destroy();
   setTimeout(() => process.exit(0), 1000).unref();

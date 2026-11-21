@@ -24,11 +24,15 @@ import {
 
 const runtime = runtimeConfig();
 
+function defaultGatewayRequest(target, options, callback) {
+  return (target.protocol === "https:" ? https : http).request(options, callback);
+}
+
 /**
  * 调网关拿一轮回复的文本增量。
  * 返回 {next} 迭代器：{done:false,value:string} / {done:true}，出错 throw。
  */
-function anthropicStream(messages, model, signal) {
+function anthropicStream(messages, model, signal, request = defaultGatewayRequest) {
   const queue = [];
   let notify = null;
   let done = false, failed = null;
@@ -38,8 +42,8 @@ function anthropicStream(messages, model, signal) {
     model: gatewayModel(runtime, model), max_tokens: 4096, stream: true, messages,
   });
   const u = gatewayTarget(runtime, "/v1/messages");
-  const lib = u.protocol === "https:" ? https : http;
-  const req = lib.request(
+  const req = request(
+    u,
     {
       hostname: u.hostname, port: u.port || (u.protocol === "https:" ? 443 : 80),
       path: u.pathname + u.search,
@@ -93,8 +97,8 @@ function anthropicStream(messages, model, signal) {
   };
 }
 
-async function* gatewayDeltas(messages, model, signal) {
-  const it = anthropicStream(messages, model, signal);
+async function* gatewayDeltas(messages, model, signal, request = defaultGatewayRequest) {
+  const it = anthropicStream(messages, model, signal, request);
   for (;;) {
     const r = await it.next();
     if (r.done) return;
@@ -105,7 +109,7 @@ async function* gatewayDeltas(messages, model, signal) {
 // ── 服务 ─────────────────────────────────────────────────────
 // deps: ensureConv(id) -> conv；listConvs() -> conv[]；log(...)
 // conv 约定字段：uuid/name/created_at/updated_at/turns[]/nextIndex/leafMessageId
-export function createConversationService({ ensureConv, listConvs, log, onChange = () => {} }) {
+export function createConversationService({ ensureConv, listConvs, log, onChange = () => {}, request = defaultGatewayRequest }) {
   /** convId -> {res, convId, frames, closed, hb} */
   const streams = new Map();
 
@@ -207,7 +211,7 @@ export function createConversationService({ ensureConv, listConvs, log, onChange
           if (previous === turn) break;
           if (previous.text) messages.push({ role: "assistant", content: previous.text });
         }
-        for await (const delta of gatewayDeltas(messages, turn.model, controller.signal)) {
+        for await (const delta of gatewayDeltas(messages, turn.model, controller.signal, request)) {
           if (turn.complete) break;
           turn.text += delta;
           onChange();
