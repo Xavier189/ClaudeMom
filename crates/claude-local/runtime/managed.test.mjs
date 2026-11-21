@@ -1182,8 +1182,8 @@ test("gateway forwarding preserves the configured root, authentication and selec
 test("remote HTTPS gateway requests route through the configured upstream proxy", async () => {
   const gatewayCalls = [];
   const tlsGateway = https.createServer({
-    key: fs.readFileSync(path.join(here, "ca/server.key")),
-    cert: fs.readFileSync(path.join(here, "ca/server.crt")),
+    key: fs.readFileSync(path.join(testCaDir, "server.key")),
+    cert: fs.readFileSync(path.join(testCaDir, "server.crt")),
   }, (req, res) => {
     const chunks = [];
     req.on("data", (chunk) => chunks.push(chunk));
@@ -1222,12 +1222,13 @@ test("remote HTTPS gateway requests route through the configured upstream proxy"
   upstreamProxy.listen(0, "127.0.0.1");
   await once(upstreamProxy, "listening");
 
-  const instance = await start({
-    CLAUDE_LOCAL_GATEWAY_URL: "https://gateway.anthropic.com",
-    CLAUDE_LOCAL_UPSTREAM_PROXY: `http://127.0.0.1:${upstreamProxy.address().port}`,
-    NODE_EXTRA_CA_CERTS: path.join(here, "ca/ca.pem"),
-  });
+  let instance;
   try {
+    instance = await start({
+      CLAUDE_LOCAL_GATEWAY_URL: "https://gateway.anthropic.com",
+      CLAUDE_LOCAL_UPSTREAM_PROXY: `http://127.0.0.1:${upstreamProxy.address().port}`,
+      NODE_EXTRA_CA_CERTS: path.join(testCaDir, "ca.pem"),
+    });
     // 1. CLI / Desktop forwardGateway (/v1/messages)
     const forwarded = await request(instance, "/v1/messages", {
       body: { model: modelIds[0], messages: [{ role: "user", content: "hello" }] },
@@ -1249,7 +1250,7 @@ test("remote HTTPS gateway requests route through the configured upstream proxy"
     assert.equal(gatewayCalls[0].auth, "Bearer test-local-gateway-token");
     assert.equal(gatewayCalls[1].stream, true);
   } finally {
-    await stop(instance);
+    if (instance) await stop(instance);
     upstreamProxy.closeAllConnections();
     upstreamProxy.close();
     tlsGateway.closeAllConnections();
