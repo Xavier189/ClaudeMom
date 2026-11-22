@@ -89,7 +89,7 @@ fn within(text: &str, max: usize) -> bool {
     text.encode_utf16().count() <= max
 }
 
-fn valid_id(id: &str) -> bool {
+pub fn valid_id(id: &str) -> bool {
     let bytes = id.as_bytes();
     !bytes.is_empty()
         && bytes.len() <= 64

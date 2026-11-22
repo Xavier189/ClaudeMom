@@ -28,10 +28,11 @@ import { fileURLToPath } from "node:url";
 import { ConnectorError, connectorRecord, createConnectorService } from "./connectors.mjs";
 import { createConversationService } from "./conversation-service.mjs";
 import { isPatchedStartupAsset, startupAssets } from "./scripts/patch-dictation-start.mjs";
-import { createGatewayStreamParser, createStateStore, gatewayBody, gatewayHttpError, gatewayModel, gatewayTarget, isLocalNetworkHost, isPrivateFile, mergePoolModels, modelList, modelSelectors, modelWindow, normalizeCurrentUserAccess, planProfile, runtimeConfig } from "./runtime.mjs";
+import { createGatewayStreamParser, createStateStore, gatewayBody, gatewayHttpError, gatewayModel, gatewayTarget, isLocalNetworkHost, isPrivateFile, mergePoolModels, modelList, modelSelectors, modelWindow, normalizeCurrentUserAccess, opencodeSessionHeaders, planProfile, requestSessionId, runtimeConfig } from "./runtime.mjs";
 import { createOfficialAssets, loadCoworkSystemPrompt } from "./official-assets.mjs";
 import { EXTENSION_PREFIX, createExtensions } from "./extensions.mjs";
 import { DIRECTORY_MARKETPLACE, installablePlugin, installedDirectoryRecord, libraryItem, pluginRecord, pluginRepository, zipSubtree } from "./plugins.mjs";
+import { createBlobStore, createProjectApi, withProjectContext, withProjectMessages } from "./projects.mjs";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const runtime = runtimeConfig();
@@ -534,11 +535,25 @@ const CONV_STATE = new Map();
 const NOTIFICATION_SETTINGS = new Map();
 const INSTALLED_PLUGINS = new Map(); // 插件 id → 安装时的目录记录
 const CONNECTORS = new Map(); // 连接器 uuid → 记录（见 connectors.mjs）
+const PROJECTS = new Map(); // 项目 uuid → 记录（见 projects.mjs）
 let DEVICE_ROW = null; // Code 模式注册的设备行 {id, k, ...}
 const stateStore = createStateStore(STATE_FILE, CONV_STATE, NOTIFICATION_SETTINGS, (warning) => {
   persistenceWarning = warning;
   console.error(warning);
-}, INSTALLED_PLUGINS, CONNECTORS);
+}, INSTALLED_PLUGINS, CONNECTORS, PROJECTS);
+const projectApi = createProjectApi({
+  projects: PROJECTS,
+  // 项目知识的正文和上传的文件放在状态文件旁边，不进状态文件。
+  blobs: createBlobStore(STATE_FILE ? path.join(path.dirname(STATE_FILE), "project-files") : null),
+  account: ACCOUNT,
+  changed: () => stateStore.flush(),
+  conversations: () => [...CONV_STATE.values()],
+  conversationRecord: (conv) => convToRest(conv),
+  removeConversation: (uuid) => CONV_STATE.delete(uuid),
+  json,
+  readBody,
+  decodeJsonBody,
+});
 
 function ensureConv(uuid) {
   if (!CONV_STATE.has(uuid)) {
@@ -567,6 +582,8 @@ const conversationService = createConversationService({
   log,
   onChange: (flush) => flush ? stateStore.flush() : stateStore.changed(),
   request: (target, options, callback) => gatewayRequest(target, options, callback),
+  projectContext: (conv) => projectApi.context(conv.project_uuid),
+  hasProject: (uuid) => projectApi.has(uuid),
 });
 
 function pushMessage(conv, msg) {
@@ -832,6 +849,17 @@ function allowConnectorSignIn(result, template) {
   };
 }
 
+// 项目知识里能传图片：GrowthBook 功能 `project_image`（id 同样是功能名的 hashCode）。录制模板里是 false，
+// 知识面板就只收文档。图片由本地项目接口存下、对话时发给模型（见 projects.mjs）。
+const PROJECT_IMAGE_FEATURE_ID = "3346981045";
+function allowProjectImages(result, template) {
+  if (!template?.org_growthbook?.features || !result.org_growthbook?.features) return;
+  result.org_growthbook = {
+    ...result.org_growthbook,
+    features: { ...result.org_growthbook.features, [PROJECT_IMAGE_FEATURE_ID]: { defaultValue: true } },
+  };
+}
+
 let resolvedBootstrapCache;
 // 主页问候语里带着称呼：模板里是「Local User」（脱敏时换的），按设置里的用户名换掉。
 const TEMPLATE_DISPLAY_NAME = "Local User";
@@ -868,6 +896,8 @@ function resolvedBootstrap() {
   result.current_user_access = normalizeCurrentUserAccess(result.current_user_access, runtime);
   if (!runtime.hubHome) useClassicHome(result, template);
   allowConnectorSignIn(result, template);
+  allowProjectImages(result, template);
+  result.gated_messages = withProjectMessages(result.gated_messages);
   if (useOfficialShell) {
     // 模板里的 gated_imports 是录制时线上版本的分块清单，与本机外壳对不上：换成本机版本。
     result.gated_imports = {};
@@ -880,6 +910,47 @@ function resolvedBootstrap() {
 
 // REST 侧的会话条目：拿录制文件里的第一条当模板，叠动态字段
 let REST_CONV_TEMPLATE = null;
+
+// 记忆（#43）：本地网关没有记忆合成，模型请求也不带记忆。这里只让设置页读写的形状对得上
+// （{} 会被 zod 判为缺 memory / controls / updated_at，报「无法保存记忆」），改动在本次运行内保留。
+let MEMORY_SETTINGS;
+function memorySettings() {
+  if (!MEMORY_SETTINGS) {
+    try {
+      if (!dataManaged) MEMORY_SETTINGS = JSON.parse(fs.readFileSync(path.join(POC_MOCK, "api", "memory_settings.json"), "utf8"));
+    } catch {}
+    MEMORY_SETTINGS ??= {
+      enabled_saffron: null, enabled_saffron_search: false, enabled_melange: null,
+      memory_mode: "melange", classic_mode_available: false,
+      melange_available: false, melange_imported_at: null,
+    };
+  }
+  return MEMORY_SETTINGS;
+}
+/** memory_mode 按客户端乐观更新的同一套规则推算。 */
+function updateMemorySettings(body) {
+  const settings = memorySettings();
+  for (const key of ["enabled_saffron", "enabled_saffron_search", "enabled_melange"]) {
+    if (typeof body[key] === "boolean") settings[key] = body[key];
+  }
+  if ("enabled_melange" in body) {
+    settings.memory_mode = body.enabled_melange === true ? "melange" : body.enabled_saffron === true ? "classic" : "off";
+  } else if ("enabled_saffron" in body && settings.memory_mode !== "melange") {
+    settings.memory_mode = body.enabled_saffron === true ? "classic" : "off";
+  }
+  if (body.clear_data === true) setMemoryControls(null);
+  return settings;
+}
+const MEMORY = {
+  memory: "", controls: null, updated_at: null,
+  controls_version: null, project_import: null, project_memory_mode: null,
+};
+function setMemoryControls(controls) {
+  MEMORY.controls = controls?.length ? controls : null;
+  MEMORY.memory = (controls ?? []).map((c) => `- ${c}`).join("\n");
+  MEMORY.controls_version = controls ? crypto.randomUUID() : null;
+  MEMORY.updated_at = controls ? now() : null;
+}
 
 function restTime(value, fallback) {
   const date = value ? new Date(value) : null;
@@ -927,12 +998,14 @@ function convToRest(c, { messages = false } = {}) {
   }
   const live = c.turns?.some((t) => !t.complete);
   const title = c.name && c.name !== "New conversation" ? c.name : "";
+  const project = c.project_uuid ? PROJECTS.get(c.project_uuid) : undefined;
   return {
     ...REST_CONV_TEMPLATE,
     // 新版前端会对这些字段直接调用数组/对象操作；录制的 conversations.json 可能为空，
     // 而旧模板字段也可能是 null，因此本地 API 必须保证返回正确形状。
     settings: REST_CONV_TEMPLATE.settings && typeof REST_CONV_TEMPLATE.settings === "object" ? REST_CONV_TEMPLATE.settings : {},
-    project_uuid: REST_CONV_TEMPLATE.project_uuid ?? null,
+    project_uuid: project ? project.uuid : null,
+    ...(project ? { project: { uuid: project.uuid, name: project.name } } : {}),
     is_starred: REST_CONV_TEMPLATE.is_starred ?? false,
     is_archived: REST_CONV_TEMPLATE.is_archived ?? false,
     files: Array.isArray(REST_CONV_TEMPLATE.files) ? REST_CONV_TEMPLATE.files : [],
@@ -979,7 +1052,7 @@ function sanitizeGeneratedTitle(raw) {
   return line.length > 80 ? `${line.slice(0, 80)}…` : line;
 }
 
-function generateSessionTitle(rawText, requestedModel, emptyFallback, callback) {
+function generateSessionTitle(rawText, requestedModel, emptyFallback, callback, sessionId) {
   const input = extractTitleInput(rawText);
   const fallback = fallbackSessionTitle(input, emptyFallback);
   if (!input) return callback(fallback);
@@ -1018,6 +1091,7 @@ function generateSessionTitle(rawText, requestedModel, emptyFallback, callback) 
         "x-api-key": runtime.key,
         authorization: `Bearer ${runtime.key}`,
         "anthropic-version": "2023-06-01",
+        ...opencodeSessionHeaders(target, () => sessionId),
       },
       // 网关在跑长任务时首字可能排队：标题生成等久一点，别退回“截断提示词”。
       timeout: 20000,
@@ -1080,12 +1154,29 @@ function mockApi(req, res, url) {
     return json(res, { ...base, data: merged });
   }
 
+  if (/^\/api\/organizations\/[^/]+\/memory\/settings$/.test(p)) {
+    if (method === "GET") return json(res, memorySettings());
+    return readBody(req, (raw) => json(res, updateMemorySettings(decodeJsonBody(req, raw))));
+  }
+  const memoryMatch = p.match(/^\/api\/organizations\/[^/]+\/memory(?:\/(controls|synthesize|reset))?$/);
+  if (memoryMatch) {
+    if (method === "GET" || memoryMatch[1] === "synthesize") return json(res, MEMORY);
+    return readBody(req, (raw) => {
+      const body = decodeJsonBody(req, raw);
+      if (memoryMatch[1] === "controls" && Array.isArray(body.controls)) {
+        setMemoryControls(body.controls.filter((c) => typeof c === "string"));
+      } else if (memoryMatch[1] === "reset") {
+        setMemoryControls(null);
+      }
+      json(res, MEMORY);
+    });
+  }
+
   // 录制下来的真实接口形状（mock/api/*.json）
   const apiMap = [
     [/\/reflections\/settings$/, "reflections_settings"],
     [/\/user_settings$/, "claude_code_user_settings"],
     [/\/mcp\/remote_servers_with_connection$/, "mcp_servers"],
-    [/\/memory\/settings$/, "memory_settings"],
     [/^\/api\/account_profile$/, "account_profile"],
     [/\/trial_status$/, "trial_status"],
     [/\/skills\/list-skills$/, "skills"],
@@ -1112,11 +1203,6 @@ function mockApi(req, res, url) {
             checksum: "local-1", content: { entries: {} },
           },
           mcp_servers: [],
-          memory_settings: {
-            enabled_saffron: null, enabled_saffron_search: false, enabled_melange: null,
-            memory_mode: "melange", classic_mode_available: false,
-            melange_available: false, melange_imported_at: null,
-          },
           account_profile: {
             work_function: "", conversation_preferences: null, cowork_global_instructions: null,
             cowork_instructions_union: false, conversation_preferences_cloud_max_chars: 10000,
@@ -1260,6 +1346,7 @@ function forcedDesktopFeature(value) {
   }
   if (pluginApi(req, res, url, p)) return;
   if (connectorApi(req, res, url, p)) return;
+  if (projectApi.handle(req, res, url, p)) return;
 
   // 分页/列表类接口：客户端会 flatMap 取 .items/.data，回 {} 会出 [undefined] 元素
   // → render 时 TypeError 进 fatal boundary（0NV6PUA 崩溃页的来源）
@@ -1269,8 +1356,6 @@ function forcedDesktopFeature(value) {
     pagination: { has_more: false, next_cursor: null, cursor: null },
   };
   if (/\/library(\/|$)/.test(p)) return json(res, pageShape);
-  if (/\/projects\/count$/.test(p)) return json(res, { count: 0 });
-  if (/\/projects(_v2)?$/.test(p)) return json(res, pageShape);
   // Code 模式 OAuth：刷新 token（被通用 /v1/ 兜底吃掉会导致 stale_relogin 常驻）
   if (p === "/v1/oauth/token" && req.method === "POST") {
     return json(res, {
@@ -1419,10 +1504,6 @@ function forcedDesktopFeature(value) {
   if (p === "/api/organizations") {
     return jsonWithActiveOrg(res, { organizations: [ORG], data: [ORG], items: [ORG] });
   }
-  // org 级别的设置/记忆/skills 端点：未覆盖的通用 mock 形状会触发前端 parse 失败 notice
-  if (/\/memory\/settings/.test(p)) {
-    return json(res, { settings: {}, entries: [], items: [] });
-  }
   if (/\/skills\/download-dot-skill-file/.test(p)) {
     if (runtime.managed && !runtime.recordedDir) {
       return json(res, { type: "error", error: { type: "not_found_error", message: "Cloud skill archive is unavailable in local mode" } }, 404);
@@ -1482,6 +1563,10 @@ function forcedDesktopFeature(value) {
           ? body.uuid
           : crypto.randomUUID();
         const conv = ensureConv(requestedId);
+        if (projectApi.has(body.project_uuid)) {
+          conv.project_uuid = body.project_uuid;
+          stateStore.flush();
+        }
         if (typeof body.name === "string" && body.name.trim()) {
           conv.name = body.name.trim().slice(0, 200);
           conv.updated_at = now();
@@ -1507,7 +1592,7 @@ function forcedDesktopFeature(value) {
           stateStore.flush();
         }
         json(res, { title });
-      });
+      }, convTitleMatch[1]);
     });
   }
   const convMatch = p.match(/\/chat_conversations\/([^/]+)$/);
@@ -1552,6 +1637,12 @@ function forcedDesktopFeature(value) {
         conv.model = model;
         stateStore.changed();
       }
+      // 网页版不单独建会话：第一条消息的 create_conversation_params 里带着项目。
+      const projectUuid = body.create_conversation_params?.project_uuid;
+      if (conv && !conv.project_uuid && projectApi.has(projectUuid)) {
+        conv.project_uuid = projectUuid;
+        stateStore.changed();
+      }
       const sendEv = (ev, obj) => {
         res.write(`event: ${ev}\ndata: ${JSON.stringify(obj)}\n\n`);
       };
@@ -1587,14 +1678,14 @@ function forcedDesktopFeature(value) {
         sendEv("message_stop", { type: "message_stop" });
         res.end();
       };
-      const payload = JSON.stringify({
+      const payload = JSON.stringify(withProjectContext({
         model,
         max_tokens: 4096,
         stream: true,
         messages: conv ? conv.chat_messages.map((message) => ({
           role: message.sender === "human" ? "user" : "assistant", content: message.text,
         })) : [{ role: "user", content: prompt }],
-      });
+      }, projectApi.context(conv?.project_uuid)));
       const target = gatewayTarget(runtime, "/v1/messages");
       const greq = gatewayRequest(
         target,
@@ -1610,6 +1701,7 @@ function forcedDesktopFeature(value) {
             authorization: `Bearer ${runtime.key}`,
             "anthropic-version": "2023-06-01",
             accept: "text/event-stream",
+            ...opencodeSessionHeaders(target, () => convUuid),
           },
         },
         (gres) => {
@@ -1860,6 +1952,7 @@ function forwardGateway(req, res, requestPath, raw) {
   }
   const target = gatewayTarget(runtime, requestPath);
   const headers = {
+    ...opencodeSessionHeaders(target, () => requestSessionId(req.headers, body)),
     ...req.headers, host: target.host, "content-length": body.length,
     "x-api-key": runtime.key, authorization: `Bearer ${runtime.key}`,
   };

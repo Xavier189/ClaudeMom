@@ -24,8 +24,9 @@ export function parseManifest(raw, id) {
   if (!manifest || typeof manifest !== "object" || Array.isArray(manifest)) return null;
   if (manifest.id !== id || !ID.test(id)) return null;
   if (!text(manifest.name, 64) || !manifest.name.trim() || !text(manifest.version, 64) || !VERSION.test(manifest.version)) return null;
-  if (manifest.author !== undefined && !text(manifest.author, 64)) return null;
-  if (manifest.description !== undefined && !text(manifest.description, 500)) return null;
+  // null 和不写一样（Rust 侧按 Option 读）。
+  if (manifest.author != null && !text(manifest.author, 64)) return null;
+  if (manifest.description != null && !text(manifest.description, 500)) return null;
   const scripts = files(manifest.scripts, ".js");
   const styles = files(manifest.styles, ".css");
   if (!scripts || !styles || !scripts.length && !styles.length) return null;
