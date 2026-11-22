@@ -306,3 +306,15 @@ button.cm-update-chip:hover { background: var(--cm-accent); color: #fff; }
 .cm-settings > p { margin: 0; }
 .cm-ext-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
 .cm-ext-desc { margin-top: 3px; line-height: 1.5; }
+.cm-seg { display: inline-flex; padding: 2px; gap: 2px; border-radius: 7px; background: rgba(127, 110, 90, 0.1); }
+.cm-seg button {
+  display: inline-flex; align-items: center; gap: 6px;
+  height: 26px; padding: 0 12px; border: 0; border-radius: 5px; background: transparent; color: var(--cm-muted);
+}
+.cm-seg button[aria-selected="true"] { background: var(--cm-panel); color: var(--cm-text); font-weight: 550; box-shadow: 0 1px 2px rgba(0, 0, 0, 0.12); }
+.cm-seg-count { font-size: 11px; font-weight: 400; color: var(--cm-muted); }
+.cm-seg-count[data-tone="accent"] { color: var(--cm-accent); }
+.cm-search { width: 200px; height: 28px; padding: 0 8px; border: 1px solid var(--cm-line-strong); border-radius: var(--cm-radius); background: var(--cm-panel); }
+.cm-search:focus { outline: none; border-color: var(--cm-accent); box-shadow: 0 0 0 3px var(--cm-accent-soft); }
+.cm-star { width: 11px; height: 11px; margin-right: 2px; vertical-align: -1px; }
+.cm-market-loading { height: 120px; }

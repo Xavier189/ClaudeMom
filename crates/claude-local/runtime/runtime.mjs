@@ -5,6 +5,7 @@ import path from "node:path";
 import { StringDecoder } from "node:string_decoder";
 import { validConnector } from "./connectors.mjs";
 import { installablePlugin } from "./plugins.mjs";
+import { validProject } from "./projects.mjs";
 
 const MAX_STATE_BYTES = 32 * 1024 * 1024;
 const MAX_TEXT = 1024 * 1024;
@@ -153,6 +154,34 @@ export function gatewayTarget(config, requestPath) {
   target.pathname = `${target.pathname.replace(/\/+$/, "")}/${requested.pathname.replace(/^\/+/, "")}`;
   target.search = requested.search;
   return target;
+}
+
+const OPENCODE_FALLBACK_SESSION = crypto.randomUUID();
+
+/**
+ * OpenCode Go（opencode.ai）要求每个请求带 x-opencode-session，缺了回 400 MissingSessionID（#42）。
+ * 它按会话分缓存，同一会话要一直用同一个值：`sessionId()` 给出会话 ID；没有会话的请求
+ * （标题生成、Claude 的模型探测）用进程启动时生成的固定值。其它上游不加。
+ */
+export function opencodeSessionHeaders(target, sessionId = () => "") {
+  if (!/(^|\.)opencode\.ai$/i.test(target.hostname)) return {};
+  const value = sessionId();
+  const valid = typeof value === "string" && /^[\x21-\x7e]{1,200}$/.test(value);
+  return { "x-opencode-session": valid ? value : OPENCODE_FALLBACK_SESSION };
+}
+
+/** /v1/messages 请求里 Claude 自己的会话 ID：请求头，或 metadata 里的 session_id / user_id 中的会话段。 */
+export function requestSessionId(headers, body) {
+  const header = headers["x-claude-code-session-id"];
+  if (typeof header === "string" && header) return header;
+  try {
+    const metadata = JSON.parse(body.toString("utf8"))?.metadata;
+    if (typeof metadata?.session_id === "string" && metadata.session_id) return metadata.session_id;
+    if (typeof metadata?.user_id === "string") {
+      return metadata.user_id.match(/session(?:_id)?["':_\s]*([0-9a-f]{8}-[0-9a-f-]{27})/i)?.[1] || "";
+    }
+  } catch {}
+  return "";
 }
 
 const WINDOW_SUFFIX = /\[\d+[km]\]$/i;
@@ -596,6 +625,7 @@ function validateConversation(conv) {
     isDate(conv.created_at) && isDate(conv.updated_at) &&
     Number.isSafeInteger(conv.nextIndex) && conv.nextIndex >= 0 &&
     (conv.leafMessageId === null || isId(conv.leafMessageId)) &&
+    (conv.project_uuid === undefined || conv.project_uuid === null || isId(conv.project_uuid)) &&
     Array.isArray(conv.turns) && conv.turns.length <= 10000 && conv.turns.every(validateTurn) &&
     Array.isArray(conv.chat_messages) && conv.chat_messages.length <= 20000 &&
     conv.chat_messages.every((message) => isRecord(message) && isId(message.uuid) &&
@@ -634,9 +664,9 @@ export function isLocalNetworkHost(hostname) {
 
 /**
  * `plugins`：装上的插件，id → 安装时那份目录记录。`connectors`：添加的连接器，uuid → 记录（含登录令牌）。
- * 旧状态文件没有这两项。
+ * `projects`：项目，uuid → 记录（知识正文和文件不在这里，见 projects.mjs）。旧状态文件没有这几项。
  */
-export function createStateStore(file, conversations, notifications, warn = () => {}, plugins = new Map(), connectors = new Map()) {
+export function createStateStore(file, conversations, notifications, warn = () => {}, plugins = new Map(), connectors = new Map(), projects = new Map()) {
   let timer;
   let disabled = false;
   if (file && fs.existsSync(file)) {
@@ -650,7 +680,9 @@ export function createStateStore(file, conversations, notifications, warn = () =
         !(state.plugins === undefined || Array.isArray(state.plugins) && state.plugins.length <= 500 &&
           state.plugins.every(installablePlugin)) ||
         !(state.connectors === undefined || Array.isArray(state.connectors) && state.connectors.length <= 500 &&
-          state.connectors.every(validConnector))) throw new Error("Invalid state contract");
+          state.connectors.every(validConnector)) ||
+        !(state.projects === undefined || Array.isArray(state.projects) && state.projects.length <= 2000 &&
+          state.projects.every(validProject))) throw new Error("Invalid state contract");
       for (const conv of state.conversations) {
         // 中断的请求不自动重发，避免重启后重复计费或执行。
         for (const turn of conv.turns) {
@@ -666,6 +698,7 @@ export function createStateStore(file, conversations, notifications, warn = () =
       for (const entry of state.notifications) notifications.set(entry.org, entry.value);
       for (const entry of state.plugins ?? []) plugins.set(entry.id, entry);
       for (const entry of state.connectors ?? []) connectors.set(entry.uuid, entry);
+      for (const entry of state.projects ?? []) projects.set(entry.uuid, entry);
     } catch {
       disabled = true;
       warn("Local conversation state is invalid; the original file was preserved");
@@ -683,6 +716,7 @@ export function createStateStore(file, conversations, notifications, warn = () =
         notifications: [...notifications].map(([org, value]) => ({ org, value })),
         plugins: [...plugins.values()],
         connectors: [...connectors.values()],
+        projects: [...projects.values()],
       }));
       if (body.length > MAX_STATE_BYTES) throw new Error("State exceeds size limit");
       fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });

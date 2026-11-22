@@ -241,10 +241,10 @@ async function response(req, body) {
   return result;
 }
 
-async function request(pathname, { host, body, method = body === undefined ? "GET" : "POST", beforeBody } = {}) {
-  const raw = body === undefined ? undefined : JSON.stringify(body);
+async function request(pathname, { host, body, type = "application/json", method = body === undefined ? "GET" : "POST", beforeBody } = {}) {
+  const raw = body === undefined ? undefined : Buffer.isBuffer(body) ? body : JSON.stringify(body);
   const headers = raw === undefined ? {} : {
-    "content-type": "application/json",
+    "content-type": type,
     "content-length": Buffer.byteLength(raw),
   };
   const send = async (req) => {
@@ -640,6 +640,7 @@ after(async () => {
   if (dictationStateDir) {
     fs.unlinkSync(path.join(dictationStateDir, "dictation-helper.json"));
     fs.unlinkSync(path.join(dictationStateDir, "conversation-state.json"));
+    fs.rmSync(path.join(dictationStateDir, "project-files"), { recursive: true, force: true });
     fs.rmdirSync(dictationStateDir);
   }
   if (dictationCacheDir) {
@@ -763,6 +764,103 @@ test("Cowork plugin metadata is a dictionary rather than a paginated list", asyn
   const result = await request("/api/organizations/local/cowork_plugin_metadata", { host: "claude.ai" });
   assert.equal(result.status, 200);
   assert.deepEqual(result.body, {});
+});
+
+test("memory settings and memory edits answer in the shapes the settings page validates", async () => {
+  const settings = "/api/organizations/local/memory/settings";
+  const off = await request(settings, { host: "claude.ai", body: { enabled_melange: false, enabled_saffron: false } });
+  assert.equal(off.status, 200);
+  assert.equal(off.body.memory_mode, "off");
+  assert.equal(off.body.enabled_saffron, false);
+  assert.equal((await request(settings, { host: "claude.ai" })).body.memory_mode, "off");
+  const classic = await request(settings, { host: "claude.ai", body: { enabled_melange: false, enabled_saffron: true } });
+  assert.equal(classic.body.memory_mode, "classic");
+
+  const memory = await request("/api/organizations/local/memory?project_uuid=p1", { host: "claude.ai" });
+  assert.equal(memory.status, 200);
+  assert.equal(typeof memory.body.memory, "string");
+  assert.ok("controls" in memory.body && "updated_at" in memory.body);
+
+  const saved = await request("/api/organizations/local/memory/controls", {
+    host: "claude.ai", method: "PUT", body: { controls: ["喜欢简短的回答"], base_controls_version: null },
+  });
+  assert.equal(saved.status, 200);
+  assert.deepEqual(saved.body.controls, ["喜欢简短的回答"]);
+  assert.equal(typeof saved.body.controls_version, "string");
+  assert.ok(!Number.isNaN(Date.parse(saved.body.updated_at)));
+  assert.deepEqual((await request("/api/organizations/local/memory", { host: "claude.ai" })).body.controls, ["喜欢简短的回答"]);
+
+  const reset = await request("/api/organizations/local/memory/reset", { host: "claude.ai", body: {} });
+  assert.equal(reset.body.controls, null);
+});
+
+test("project conversation lists are pages rather than empty objects", async () => {
+  const result = await request("/api/organizations/local/projects/p1/conversations_v2?limit=30&offset=0", { host: "claude.ai" });
+  assert.equal(result.status, 200);
+  assert.deepEqual(result.body.data, []);
+  assert.equal(result.body.pagination.has_more, false);
+});
+
+/** 一个文件字段的 multipart/form-data 请求体。 */
+function formFile(filename, type, data) {
+  const boundary = `----fixture${crypto.randomUUID()}`;
+  return {
+    type: `multipart/form-data; boundary=${boundary}`,
+    body: Buffer.concat([
+      Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="${filename}"\r\nContent-Type: ${type}\r\n\r\n`),
+      Buffer.from(data),
+      Buffer.from(`\r\n--${boundary}--\r\n`),
+    ]),
+  };
+}
+
+test("document conversion extracts text from Office files and plain text, and refuses what it cannot read", async () => {
+  const convert = (filename, type, data) => request("/api/organizations/local/convert_document", { host: "claude.ai", ...formFile(filename, type, data) });
+  const docx = storedZip({
+    "word/document.xml": '<w:document><w:body><w:p><w:r><w:t>第一段 &amp; more</w:t></w:r></w:p><w:p><w:r><w:t>Second</w:t></w:r><w:r><w:tab/><w:t>tab</w:t></w:r></w:p></w:body></w:document>',
+  });
+  const converted = await convert("报告.docx", "application/vnd.openxmlformats-officedocument.wordprocessingml.document", docx);
+  assert.equal(converted.status, 200);
+  assert.equal(converted.body.file_name, "报告.docx");
+  assert.equal(converted.body.extracted_content, "第一段 & more\nSecond\ttab");
+
+  const xlsx = storedZip({
+    "xl/sharedStrings.xml": "<sst><si><t>名称</t></si><si><t>数量</t></si></sst>",
+    "xl/worksheets/sheet1.xml": '<worksheet><sheetData><row><c t="s"><v>0</v></c><c t="s"><v>1</v></c></row><row><c t="inlineStr"><is><t>苹果</t></is></c><c><v>3</v></c></row></sheetData></worksheet>',
+  });
+  assert.equal((await convert("表.xlsx", "application/octet-stream", xlsx)).body.extracted_content, "## Sheet 1\n名称\t数量\n苹果\t3");
+
+  const pptx = storedZip({ "ppt/slides/slide1.xml": "<p:sld><a:p><a:r><a:t>标题</a:t></a:r></a:p></p:sld>" });
+  assert.equal((await convert("演示.pptx", "application/octet-stream", pptx)).body.extracted_content, "## Slide 1\n标题");
+
+  assert.equal((await convert("notes.md", "text/markdown", "# 标题\n正文")).body.extracted_content, "# 标题\n正文");
+  const pdf = await convert("scan.pdf", "application/pdf", "%PDF-1.7\n...");
+  assert.equal(pdf.status, 422);
+  assert.equal(pdf.body.error.details.error_code, "extraction_failed");
+});
+
+test("project uploads keep images and PDFs as files and refuse other files", async () => {
+  const org = "/api/organizations/local";
+  const project = (await request(`${org}/projects`, { host: "claude.ai", body: { name: "Uploads" } })).body;
+  const upload = (filename, type, data) => request(`${org}/projects/${project.uuid}/upload`, { host: "claude.ai", ...formFile(filename, type, data) });
+
+  const pdf = await upload("spec.pdf", "application/pdf", "%PDF-1.4\n1 0 obj << /Type /Page >> endobj\n2 0 obj << /Type /Page >> endobj\n3 0 obj << /Type /Pages >> endobj");
+  assert.equal(pdf.status, 200);
+  assert.equal(pdf.body.file_kind, "document");
+  assert.equal(pdf.body.document_asset.page_count, 2);
+  assert.equal(pdf.body.document_asset.url, `/api/local/files/${pdf.body.file_uuid}/document`);
+  // 客户端把 Office 文档送去转文本、纯文本自己读，别的文件传到这里一律不收。
+  const text = await upload("notes.txt", "text/plain", "plain knowledge");
+  assert.equal(text.status, 400);
+  assert.equal(text.body.error.details.error_code, "invalid_file_type");
+
+  const files = (await request(`${org}/projects/${project.uuid}/files`, { host: "claude.ai" })).body;
+  assert.deepEqual(files.map((file) => file.file_name), ["spec.pdf"]);
+  assert.deepEqual((await request(`${org}/projects/${project.uuid}/docs`, { host: "claude.ai" })).body, []);
+
+  const removed = await request(`${org}/projects/${project.uuid}/files/delete_many`, { host: "claude.ai", body: { file_uuids: [pdf.body.file_uuid] } });
+  assert.equal(removed.status, 200);
+  assert.deepEqual((await request(`${org}/projects/${project.uuid}/files`, { host: "claude.ai" })).body, []);
 });
 
 test("local mock accounts do not request identity verification", async () => {

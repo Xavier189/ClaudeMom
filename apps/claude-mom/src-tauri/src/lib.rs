@@ -3,6 +3,7 @@
 mod commands;
 mod host;
 mod log;
+mod market;
 mod upstreams;
 
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -67,6 +68,9 @@ pub fn run() {
             commands::claude_local_extension_import,
             commands::claude_local_extension_remove,
             commands::claude_local_extension_open_folder,
+            commands::claude_local_extension_market,
+            commands::claude_local_extension_install,
+            commands::claude_local_extension_open_page,
             commands::claude_mom_load,
             commands::claude_mom_save_profile,
             commands::claude_mom_delete_profile,
